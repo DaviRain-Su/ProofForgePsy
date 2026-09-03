@@ -4,17 +4,10 @@ open Lake DSL
 package «proofforge-psy» where
   version := v!"0.0.1"
 
-/-- Shared Attr + Core/Crypto surface used by the Psy SDK. -/
-lean_lib ProofForgeCore where
-  roots := #[
-    `ProofForge.Attr,
-    `ProofForge.Core.Codec,
-    `ProofForge.Core.Collections,
-    `ProofForge.Core.Math,
-    `ProofForge.Core.Ops,
-    `ProofForge.Core.SafeCast,
-    `ProofForge.Core.Value
-  ]
+/-- Shared Attr + Core/Crypto surface, maintained in ProofForgeCommon.
+    Bump the pin when ProofForgeCommon publishes a new Core/Crypto change. -/
+require «proofforge-common» from git
+  "https://github.com/DaviRain-Su/ProofForgeCommon.git" @ "v0.1.0"
 
 /-- Contract-facing Psy SDK: the DPN execution-context leaves the extractor
     recognizes by name. No compiler machinery. -/
@@ -23,43 +16,26 @@ lean_lib ProofForgePsySdk where
     `ProofForge.Psy.Runtime
   ]
 
-/-- Compiler: Extract, Psy Plan/IR/DPN Emit/Registry, and the `ProofForge` umbrella. -/
+/-- Compiler: Extract, Psy Plan/IR/DPN Emit/Registry, and the `ProofForge` umbrella.
+    The lib is named `ProofForgePsy` (not `ProofForge`): a lean_lib name claims its
+    namespace for this package and would shadow the `ProofForge.Core.*` /
+    `ProofForge.Crypto.*` modules exported by `proofforge-common`. -/
 @[default_target]
-lean_lib ProofForge where
-  roots := #[
-    `ProofForge,
-    `ProofForge.Cli,
-    `ProofForge.Core.CFG,
-    `ProofForge.Core.Eval,
-    `ProofForge.Core.FixedPoint,
-    `ProofForge.Core.IR,
-    `ProofForge.Core.Schema,
-    `ProofForge.Core.Target,
-    `ProofForge.Crypto.Keccak,
-    `ProofForge.Crypto.Sha256,
-    `ProofForge.Psy.Ops,
-    `ProofForge.Psy.Plan,
-    `ProofForge.Psy.Validate,
-    `ProofForge.Psy.Lower,
-    `ProofForge.Psy.Dpn.Schema,
-    `ProofForge.Psy.Dpn.JsonCodec,
-    `ProofForge.Psy.Dpn.Lower,
-    `ProofForge.Psy.Emit,
-    `ProofForge.Psy.Registry,
-    `ProofForge.Psy.Commands,
-    `ProofForge.Extract,
-    `ProofForge.Extract.IR,
-    `ProofForge.Extract.Ops,
-    `ProofForge.Extract.Lexical,
-    `ProofForge.Extract.Decode,
-    `ProofForge.Profile
+lean_lib ProofForgePsy where
+  globs := #[
+    .one `ProofForge,
+    .one `ProofForge.Cli,
+    .submodules `ProofForge.Psy,
+    .one `ProofForge.Extract,
+    .submodules `ProofForge.Extract
   ]
 
 /-- Build every module under `Examples/` (Psy fixtures only). -/
 lean_lib Examples where
   globs := #[.one `Examples, .submodules `Examples]
 
-lean_lib Tests
+lean_lib Tests where
+  globs := #[.submodules `Tests]
 
 lean_exe psyGolden where
   root := `Tests.PsyGolden

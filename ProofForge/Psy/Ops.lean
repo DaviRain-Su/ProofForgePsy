@@ -66,6 +66,7 @@ def OpExt.wellFormed (x : OpExt Val) : Bool :=
   nomatch x
 
 def Op.wellFormed (op : ProofForge.Core.Ops.Op ValKind OpExt) : Bool :=
-  ProofForge.Core.Ops.Op.wellFormed ValKind.arity OpExt.wellFormed op
+  ProofForge.Core.Ops.Op.wellFormed ValKind.arity
+    (fun kind n => n <= ValKind.arity kind) OpExt.wellFormed op
 
 end ProofForge.Psy.Ops

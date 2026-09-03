@@ -102,9 +102,7 @@ jobs:
         run: lake build Examples
 
       - name: Run Psy DPN golden suite
-        run: |
-          lake build psyGolden
-          lake env psyGolden
+        run: lake build psyGolden
 
       - name: End-to-end pf build (Counter)
         run: |

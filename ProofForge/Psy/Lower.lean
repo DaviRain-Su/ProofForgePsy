@@ -58,6 +58,9 @@ def extractRegistration :
         p.elim (motive := fun _ =>
           Except String (Psy.Ops.OpExt (Core.Ops.Val Psy.Ops.ValKind)))
   valArity := Psy.Ops.ValKind.arity
+  -- Hash/IMT leaves carry their arguments as operands; arity is the MAXIMUM
+  -- (the extractor flattens `Array UInt64` literals into individual operands).
+  valArityAllows := fun kind n => n <= Psy.Ops.ValKind.arity kind
   opWellFormed := Psy.Ops.Op.wellFormed
   cfgDialect := {
     mapValues := fun _ payload =>

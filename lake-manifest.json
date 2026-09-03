@@ -1,6 +1,16 @@
-{
- "version": "1.1.0",
+{"version": "1.2.0",
  "packagesDir": ".lake/packages",
- "packages": [],
- "inputs": {}
-}
+ "packages":
+ [{"url": "https://github.com/DaviRain-Su/ProofForgeCommon.git",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "20efcc7a6915f2cbf0ed539938a73002c6715e3d",
+   "name": "«proofforge-common»",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "v0.1.0",
+   "inherited": false,
+   "configFile": "lakefile.lean"}],
+ "name": "«proofforge-psy»",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}
