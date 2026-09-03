@@ -11,6 +11,11 @@ abbrev Op := IR.Op
 private def psyLeaf (kind : Psy.Ops.ValKind) : Val :=
   .ext (.psy kind) #[]
 
+/-- psy SDK application leaf with decoded operands (used by the decoder for
+    pf.crypto / pf.imt / effect leaves). -/
+def psyLeafWith (kind : Psy.Ops.ValKind) (operands : Array Val) : Val :=
+  .ext (.psy kind) operands
+
 @[match_pattern] def Val.psyUserId : Val := psyLeaf .ctxUserId
 @[match_pattern] def Val.psyContractId : Val := psyLeaf .ctxContractId
 @[match_pattern] def Val.psyCheckpointId : Val := psyLeaf .ctxCheckpointId
@@ -77,6 +82,8 @@ private def opValuesAny (predicate : Val → Bool) : Op → Bool
   | .indexSetLeaf _ lhs rhs _ _ | .indexSet _ lhs rhs _ _ => predicate lhs || predicate rhs
   | .ext payload => nomatch payload
   | .errorTyped frame => frame.values.any predicate
+  | .emitEvent _ payload => predicate payload
+  | .externalCall _ args => args.any predicate
   | .joinLocal _ | .forBody _ _ | .errorOverflow | .errorNamed _ => false
 
 private partial def isPsyContext : Val → Bool

@@ -88,6 +88,8 @@ private partial def opLocalIds (dialect : Dialect ValExt OpExt) :
     Op ValExt OpExt → Array Nat
   | .letLocal id value | .setLocal id value => #[id] ++ valueLocalIds value
   | .joinLocal id => #[id]
+  | .emitEvent _ payload => valueLocalIds payload
+  | .externalCall _ args => args.flatMap valueLocalIds
   | .checkedAddU64 lhs rhs | .checkedSubU64 lhs rhs | .checkedMulU64 lhs rhs
   | .checkedDivU64 lhs rhs | .checkedModU64 lhs rhs =>
       valueLocalIds lhs ++ valueLocalIds rhs
@@ -137,6 +139,8 @@ private partial def mapOpValues (dialect : Dialect ValExt OpExt)
     (mapValue : Val ValExt → Val ValExt) : Op ValExt OpExt → Op ValExt OpExt
   | .letLocal id value => .letLocal id (mapValue value)
   | .joinLocal id => .joinLocal id
+  | .emitEvent name payload => .emitEvent name (mapValue payload)
+  | .externalCall callee args => .externalCall callee (args.map mapValue)
   | .setLocal id value => .setLocal id (mapValue value)
   | .checkedAddU64 lhs rhs => .checkedAddU64 (mapValue lhs) (mapValue rhs)
   | .checkedSubU64 lhs rhs => .checkedSubU64 (mapValue lhs) (mapValue rhs)
@@ -757,6 +761,11 @@ private def fingerprintInstruction (dialect : Dialect ValExt OpExt) (state : UIn
       fingerprintValue (fingerprintString (fingerprintNat state 12) name) value
   | .ext payload =>
       fingerprintValues (fingerprintNat state 13) (dialect.values payload)
+  | .emitEvent name payload =>
+      fingerprintValue (fingerprintString (fingerprintNat state 14) name) payload
+  | .externalCall callee args =>
+      fingerprintValues (fingerprintString (fingerprintNat state 16)
+        (String.intercalate "." callee.toList)) args
 
 private def blockFingerprint (dialect : Dialect ValExt OpExt)
     (block : Block ValExt OpExt) : UInt64 :=

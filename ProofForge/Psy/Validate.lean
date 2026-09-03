@@ -18,6 +18,8 @@ private def maxFunctions : Nat := 256
 private def maxParams : Nat := 64
 private def maxBodyStatements : Nat := 4096
 private def maxExprDepth : Nat := 256
+/-- Max guarded static-unroll steps for PSY-LOOP (mirrors the DPN lowerer). -/
+private def maxUnrollBudget : Nat := 64
 
 /-- Count expression nodes with a hard depth budget; `none` = over budget. -/
 private def validateExprNodes (expr : Expr) : Option Nat :=
@@ -43,6 +45,28 @@ private def validateExprNodes (expr : Expr) : Option Nat :=
       let dt ← validateExprNodes t
       let de ← validateExprNodes e
       if dc + dt + de + 1 > maxExprDepth then none else some (dc + dt + de + 1)
+  | .hashNoPad args | .hashPad args | .hashTwoToOne args | .keccak256 args =>
+      args.foldl (init := some 1) fun acc a =>
+        match acc, validateExprNodes a with
+        | some n, some d =>
+            if n + d > maxExprDepth then none else some (n + d)
+        | _, _ => none
+  | .imtGet k | .imtContains k => do
+      let d ← validateExprNodes k
+      if d + 1 > maxExprDepth then none else some (d + 1)
+  | .imtSet k v => do
+      let dk ← validateExprNodes k
+      let dv ← validateExprNodes v
+      if dk + dv + 1 > maxExprDepth then none else some (dk + dv + 1)
+  | .imtGetExternal c k => do
+      let dc ← validateExprNodes c
+      let dk ← validateExprNodes k
+      if dc + dk + 1 > maxExprDepth then none else some (dc + dk + 1)
+  | .imtGetOther u c k | .imtContainsOther u c k => do
+      let du ← validateExprNodes u
+      let dc ← validateExprNodes c
+      let dk ← validateExprNodes k
+      if du + dc + dk + 1 > maxExprDepth then none else some (du + dc + dk + 1)
 
 private def validateExpr (expr : Expr) : Except String Unit :=
   match validateExprNodes expr with
@@ -63,6 +87,18 @@ private partial def validateStatements (stmts : Array Statement) : Except String
         validateExpr condition
         validateStatements thenBody
         validateStatements elseBody
+    | .forLoop start endExclusive maxIter body =>
+        validateExpr start
+        validateExpr endExclusive
+        if maxIter > maxUnrollBudget then
+          planError s!"for loop unroll budget {maxIter} exceeds {maxUnrollBudget}"
+        validateStatements body
+    | .emitEvent _ args =>
+        for a in args do validateExpr a
+    | .externalCall callee args =>
+        if callee.size < 2 then
+          planError "external callee must have ≥2 qualified-name components"
+        for a in args do validateExpr a
 
 /-- Does any statement in this sequence return a value (possibly under a branch)? -/
 private partial def returnsAnywhere (stmts : Array Statement) : Bool :=
@@ -70,6 +106,7 @@ private partial def returnsAnywhere (stmts : Array Statement) : Bool :=
     | .returnValue _ => true
     | .ifThenElse _ t e => returnsAnywhere t || returnsAnywhere e
     | _ => false
+
 
 /-- Return-form consistency: a branch that returns must be matched by the
     other arm (the DPN lowerer merges returns through `Select` and rejects

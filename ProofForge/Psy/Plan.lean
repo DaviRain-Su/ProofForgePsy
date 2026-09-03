@@ -38,7 +38,6 @@ inductive Expr where
   | bitOr (lhs rhs : Expr)
   | bitXor (lhs rhs : Expr)
   | boolNot (operand : Expr)
-  | select (condition thenValue elseValue : Expr)
   | shl (lhs rhs : Expr)
   | shr (lhs rhs : Expr)
   /-- Checked UInt64 bitwise-not: exact only when the operand is ≥ 2^32−1
@@ -52,6 +51,25 @@ inductive Expr where
   | ctxCallerContractId
   | ctxUserPublicKeyHash
   | ctxSessionProofTreeRoot
+  /-- ADR-0039 Poseidon gadgets, scalar product ABI (first HashOut limb).
+      Arity 1..8 (hashNoPad/hashPad), exactly 8 (hashTwoToOne), 1..16
+      (keccak256). -/
+  | hashNoPad (args : Array Expr)
+  | hashPad (args : Array Expr)
+  | hashTwoToOne (args : Array Expr)
+  | keccak256 (args : Array Expr)
+  /-- IMT self-current pilot: UInt64 key/value packed as [scalar, 0, 0, 0]
+      4-limb wire indices; base_offset = 0, capacity = 2^20. -/
+  | imtGet (key : Expr)
+  | imtContains (key : Expr)
+  | imtSet (key value : Expr)
+  /-- IMT external / other-user reads (software simulate key-addressed). -/
+  | imtGetExternal (contractId key : Expr)
+  | imtGetOther (userId contractId key : Expr)
+  | imtContainsOther (userId contractId key : Expr)
+  /-- Felt-valued conditional used to materialize carry/borrow without field
+      division. `condition` is Bool; both branches are Felt expressions. -/
+  | select (condition thenValue elseValue : Expr)
   deriving BEq, Inhabited, Repr
 
 inductive Statement where
@@ -61,6 +79,15 @@ inductive Statement where
   | returnValue (value : Expr)
   | returnNone
   | ifThenElse (condition : Expr) (thenBody elseBody : Array Statement)
+  /-- Bounded `for` static unroll (PSY-LOOP): `maxIterations` guarded steps
+      of `body` with the loop variable bound to `start + k`. -/
+  | forLoop (start endExclusive : Expr) (maxIterations : Nat) (body : Array Statement)
+  /-- DPN event record (DPN-6): identity context is circuit-side; the
+      declared event `name` is source metadata only. -/
+  | emitEvent (name : String) (args : Array Expr)
+  /-- Void synchronous external call (DPN-6 PARTIAL): hashed static
+      qualified name, `numOutputs = 0`, no response binding. -/
+  | externalCall (callee : Array String) (args : Array Expr)
   deriving BEq, Inhabited, Repr
 
 inductive FunctionKind where
@@ -94,6 +121,12 @@ structure Plan where
       Diagnostic metadata only — DPN circuits trap via assertions. -/
   errors : Array String := #[]
 
+private def joinRepr (args : Array Expr) : String :=
+  String.intercalate " " ((args.map (fun a => toString (repr a))).toList)
+
+private def renderCallee (callee : Array String) : String :=
+  String.intercalate "." callee.toList
+
 /-- Stable low-tech canonical rendering for registry digests. Not a JSON
     round-trip: purely a fingerprint of the Plan content. -/
 private partial def renderExpr : Expr → String
@@ -125,6 +158,18 @@ private partial def renderExpr : Expr → String
   | .ctxCallerContractId => "ctx callerContractId"
   | .ctxUserPublicKeyHash => "ctx userPublicKeyHash"
   | .ctxSessionProofTreeRoot => "ctx sessionProofTreeRoot"
+  -- Hash/IMT args render via `repr` (stable derived representation; the
+  -- digest only needs determinism, not the pretty form).
+  | .hashNoPad args => s!"(hashNoPad {joinRepr args})"
+  | .hashPad args => s!"(hashPad {joinRepr args})"
+  | .hashTwoToOne args => s!"(hash2to1 {joinRepr args})"
+  | .keccak256 args => s!"(keccak {joinRepr args})"
+  | .imtGet k => s!"(imtGet {repr k})"
+  | .imtContains k => s!"(imtHas {repr k})"
+  | .imtSet k v => s!"(imtSet {repr k} {repr v})"
+  | .imtGetExternal c k => s!"(imtGetExt {repr c} {repr k})"
+  | .imtGetOther u c k => s!"(imtGetOther {repr u} {repr c} {repr k})"
+  | .imtContainsOther u c k => s!"(imtHasOther {repr u} {repr c} {repr k})"
 
 private partial def renderStmts (indent : String) (stmts : Array Statement) : String :=
   let openBrace : String := "{"
@@ -145,6 +190,16 @@ private partial def renderStmts (indent : String) (stmts : Array Statement) : St
           indent, "if ", condText, " ", openBrace, nl, thnText,
           indent, closeBrace, " else ", openBrace, nl, elsText,
           indent, closeBrace, nl]
+    | .forLoop s e n body =>
+        let bodyText := renderStmts (indent ++ "  ") body
+        String.intercalate "" [
+          indent, "for ", renderExpr s, " ..< ", renderExpr e,
+          " bounded ", toString n, " ", openBrace, nl, bodyText,
+          indent, closeBrace, nl]
+    | .emitEvent name args =>
+        s!"{indent}emit {name}({joinRepr args}){nl}"
+    | .externalCall callee args =>
+        s!"{indent}call {renderCallee callee}({joinRepr args}){nl}"
   String.intercalate "" (stmts.map one).toList
 
 def renderCanonical (plan : Plan) : String :=

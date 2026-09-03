@@ -75,6 +75,9 @@ private def bTrue : UInt64 := encodeIndexedId .bool 0
 /-- Max physical state leaves admitted by this slice. -/
 def maxStateLeavesV1 : Nat := 64
 
+/-- Max guarded static-unroll steps for PSY-LOOP. -/
+def maxUnrollBudget : Nat := 64
+
 /-- View get: Constant + GetState(sub_slot 0) → output target 1. -/
 def lowerViewLoadReturnV1 (name : String) (fieldIndex : Nat) :
     Except String FunctionCircuitDefV1 := do
@@ -175,6 +178,20 @@ def WireV1.rawIndex : WireV1 → Nat
 def WireV1.operand : WireV1 → UInt64
   | w => w.encoded
 
+structure HashOutMemoEntry where
+  kind : Nat
+  argsKey : UInt64
+  hashIndex : Nat
+  limbs : Array WireV1
+  deriving Inhabited
+
+structure ImtMemoEntry where
+  kind : Nat
+  keyIdx : Nat
+  valIdx : Nat
+  result : WireV1
+  deriving Inhabited
+
 structure BuilderV1 where
   nextTarget : Nat := 0
   nextBool : Nat := 0
@@ -191,6 +208,14 @@ structure BuilderV1 where
   falseBool? : Option Nat := none
   /-- True when the Plan has >1 physical state leaf (multi-leaf map). -/
   multiLeaf : Bool := false
+  /-- Active loop-variable target wires (innermost last). -/
+  loopVars : Array WireV1 := #[]
+  /-- HashOut CSE table (kind, argsKey) → limbs. -/
+  hashOutMemo : Array HashOutMemoEntry := #[]
+  /-- IMT CSE table (kind, keyIdx, valIdx) → result wire. -/
+  imtMemo : Array ImtMemoEntry := #[]
+  /-- DPN event records emitted by this circuit. -/
+  events : Array EventRecordV1 := #[]
   deriving Inhabited
 
 private def pushTarget (b : BuilderV1) (op : OpTypeV1) (inputs : Array UInt64) :
@@ -406,6 +431,47 @@ private def emitHashOutLimb0 (b : BuilderV1) (op : OpTypeV1) :
   -- limb index 0 = shared zero Target
   pushTarget b1 .targetAt #[hashEnc, UInt64.ofNat b1.zeroTarget]
 
+/-- Fingerprint arg target indices for HashOut CSE (FNV-1a). -/
+private def hashOutArgsKey (ins : Array UInt64) : UInt64 := Id.run do
+  let mut h : UInt64 := 14695981039346656037
+  let prime : UInt64 := 1099511628211
+  for x in ins do
+    h := (h ^^^ x) * prime
+  pure h
+
+/-- Emit one HashOut op (data_type=hashOut) and four TargetAt limbs.
+    CSE by (kind, argsKey). -/
+private def emitHashOutFull (b : BuilderV1) (kind : Nat) (op : OpTypeV1)
+    (inputs : Array UInt64) : BuilderV1 × Array WireV1 := Id.run do
+  let key := hashOutArgsKey inputs
+  match b.hashOutMemo.find? (fun e => e.kind == kind && e.argsKey == key) with
+  | some e => pure (b, e.limbs)
+  | none =>
+      let hashIdx :=
+        (b.defs.filter (fun d => d.dataType == .hashOut)).size
+      let hashDef : IndexedVarDefV1 := {
+        dataType := .hashOut
+        index := hashIdx
+        opType := op
+        inputs
+      }
+      let b1 := { b with defs := b.defs.push hashDef }
+      let hashEnc := encodeIndexedId .hashOut hashIdx
+      let mut bCur := b1
+      let mut limbs : Array WireV1 := #[]
+      for i in [0:4] do
+        -- Constant limb index (cannot call emitLiteralU64 here — defined later).
+        let (bL, lit) :=
+          if i == 0 then (bCur, zeroWire bCur)
+          else pushTarget bCur .constant #[UInt64.ofNat i]
+        let (bT, tw) := pushTarget bL .targetAt #[hashEnc, UInt64.ofNat lit.rawIndex]
+        bCur := bT
+        limbs := limbs.push tw
+      let b2 := { bCur with
+        hashOutMemo := bCur.hashOutMemo.push
+          { kind, argsKey := key, hashIndex := hashIdx, limbs } }
+      pure (b2, limbs)
+
 /-- UInt64 checked add: `sum = l + r`; assert `sum ≥ l` (overflow). -/
 private def emitCheckedAdd (b : BuilderV1) (l r : WireV1) :
     Except String (BuilderV1 × WireV1) := do
@@ -606,6 +672,262 @@ private def pushAssertTrue (b : BuilderV1) (cond : WireV1) (msg : String) :
       }
   }
 
+
+/-- Gate a target wire under writeCond: select(writeCond, w, 0). When writeCond
+    is the shared ConstantTrue, return `w` unchanged. -/
+private def gateTargetUnderCond (b : BuilderV1) (writeCond : WireV1) (w : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  if writeCond == .bool b.trueBool then
+    pure (b, w)
+  else
+    emitSelect b writeCond w (zeroWire b)
+
+/-- Pack UInt64 scalar as 4-limb IMT key/value: [scalar, 0, 0, 0] wire indices. -/
+private def emitImtU64As4 (b : BuilderV1) (scalar : WireV1) :
+    Except String (BuilderV1 × Array UInt64) := do
+  let sIdx ← asTargetIndex scalar
+  let z := b.zeroTarget
+  pure (b, #[UInt64.ofNat sIdx, UInt64.ofNat z, UInt64.ofNat z, UInt64.ofNat z])
+
+/-- Static base (0) and capacity (2^20) wire indices for IMT commands. -/
+private def emitImtBaseCap (b : BuilderV1) : BuilderV1 × Nat × Nat :=
+  let baseIdx := b.zeroTarget
+  let (b1, capW) := pushTarget b .constant #[UInt64.ofNat 1048576]
+  (b1, baseIdx, capW.rawIndex)
+
+/-- Static circuit-side tree height for external/other-user IMT commands.
+    Software simulate ignores this field for key-addressed storage. -/
+private def imtDefaultTreeHeight : UInt8 := 20
+
+private def lookupImtMemo (b : BuilderV1) (kind keyIdx valIdx : Nat) :
+    Option WireV1 :=
+  match b.imtMemo.find? (fun e => e.kind == kind && e.keyIdx == keyIdx && e.valIdx == valIdx) with
+  | some e => some e.result
+  | none => none
+
+private def pushImtMemo (b : BuilderV1) (kind keyIdx valIdx : Nat) (w : WireV1) :
+    BuilderV1 :=
+  { b with imtMemo := b.imtMemo.push { kind, keyIdx, valIdx, result := w } }
+
+/-- HashOut result limb0 of a state command (GetStateCommandResultHash). -/
+private def emitImtHashResultLimb0 (b : BuilderV1) (cmdIdx : Nat) :
+    BuilderV1 × WireV1 :=
+  let hashIdx :=
+    (b.defs.filter (fun d => d.dataType == .hashOut)).size
+  let hashDef : IndexedVarDefV1 := {
+    dataType := .hashOut
+    index := hashIdx
+    opType := .getStateCommandResultHash
+    inputs := #[UInt64.ofNat cmdIdx]
+  }
+  let b1 := { b with defs := b.defs.push hashDef }
+  let getDefStep := b1.defs.size - 1
+  let b2 := { b1 with res := b1.res.push getDefStep }
+  let hashEnc := encodeIndexedId .hashOut hashIdx
+  pushTarget b2 .targetAt #[hashEnc, UInt64.ofNat b2.zeroTarget]
+
+private def emitImtGet (b : BuilderV1) (keyW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let kIdx ← asTargetIndex keyW
+  if let some w := lookupImtMemo b 0 kIdx 0 then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, baseIdx, capIdx) := emitImtBaseCap b0
+    let cmdIdx := b1.cmds.size
+    let b2 := {
+      b1 with
+        cmds := b1.cmds.push
+          (.getSelfUserCurrentIMTContractStateValue
+            (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx) key4)
+    }
+    let (b3, w) := emitImtHashResultLimb0 b2 cmdIdx
+    pure (pushImtMemo b3 0 kIdx 0 w, w)
+
+/-- IMT set → SetIMTContractStateValue; returns the written value (product ABI).
+    Memoized so `let w := set(...); store w; return w` emits one Set. -/
+private def emitImtSet (b : BuilderV1) (keyW valueW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let kIdx ← asTargetIndex keyW
+  let vIdx ← asTargetIndex valueW
+  if let some w := lookupImtMemo b 2 kIdx vIdx then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, val4) ← emitImtU64As4 b0 valueW
+    let (b2, baseIdx, capIdx) := emitImtBaseCap b1
+    let cEnc := (trueWire b2).encoded
+    let b3 := {
+      b2 with
+        cmds := b2.cmds.push
+          (.setIMTContractStateValue
+            cEnc (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx) key4 val4)
+        -- Set resolves after current defs (value wires already emitted).
+        res := b2.res.push b2.defs.size
+    }
+    pure (pushImtMemo b3 2 kIdx vIdx valueW, valueW)
+
+/-- IMT contains → ContainsSelfUserCurrentIMT + GetStateCommandResultSingle. -/
+private def emitImtContains (b : BuilderV1) (keyW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let kIdx ← asTargetIndex keyW
+  if let some w := lookupImtMemo b 1 kIdx 0 then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, baseIdx, capIdx) := emitImtBaseCap b0
+    let cmdIdx := b1.cmds.size
+    let b2 := {
+      b1 with
+        cmds := b1.cmds.push
+          (.containsSelfUserCurrentIMTContractStateValue
+            (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx) key4)
+    }
+    let (b3, w) := pushTarget b2 .getStateCommandResultSingle #[UInt64.ofNat cmdIdx]
+    let getDefStep := b3.defs.size - 1
+    let b4 := { b3 with res := b3.res.push getDefStep }
+    pure (pushImtMemo b4 1 kIdx 0 w, w)
+
+/-- IMT getExternal(contractId, key) → GetSelfUserExternalIMT… -/
+private def emitImtGetExternal (b : BuilderV1) (cidW keyW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let cIdx ← asTargetIndex cidW
+  let kIdx ← asTargetIndex keyW
+  -- kind 3 = external get; memo key = contractIdx in valIdx slot
+  if let some w := lookupImtMemo b 3 kIdx cIdx then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, baseIdx, capIdx) := emitImtBaseCap b0
+    let cmdIdx := b1.cmds.size
+    let b2 := {
+      b1 with
+        cmds := b1.cmds.push
+          (.getSelfUserExternalIMTContractStateValue
+            (UInt64.ofNat cIdx) (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx)
+            key4 imtDefaultTreeHeight)
+    }
+    let (b3, w) := emitImtHashResultLimb0 b2 cmdIdx
+    pure (pushImtMemo b3 3 kIdx cIdx w, w)
+
+/-- IMT getOther(userId, contractId, key) → GetOtherUserIMT…. -/
+private def emitImtGetOther (b : BuilderV1) (uidW cidW keyW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let uIdx ← asTargetIndex uidW
+  let cIdx ← asTargetIndex cidW
+  let kIdx ← asTargetIndex keyW
+  -- kind 4; fold user+contract into the memo valIdx slot.
+  let memoVal := uIdx * 65537 + cIdx
+  if let some w := lookupImtMemo b 4 kIdx memoVal then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, baseIdx, capIdx) := emitImtBaseCap b0
+    let cmdIdx := b1.cmds.size
+    let b2 := {
+      b1 with
+        cmds := b1.cmds.push
+          (.getOtherUserIMTContractStateValue
+            (UInt64.ofNat uIdx) (UInt64.ofNat cIdx)
+            (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx)
+            key4 imtDefaultTreeHeight)
+    }
+    let (b3, w) := emitImtHashResultLimb0 b2 cmdIdx
+    pure (pushImtMemo b3 4 kIdx memoVal w, w)
+
+/-- IMT containsOther(userId, contractId, key). -/
+private def emitImtContainsOther (b : BuilderV1) (uidW cidW keyW : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let uIdx ← asTargetIndex uidW
+  let cIdx ← asTargetIndex cidW
+  let kIdx ← asTargetIndex keyW
+  let memoVal := uIdx * 65537 + cIdx
+  if let some w := lookupImtMemo b 5 kIdx memoVal then
+    pure (b, w)
+  else
+    let (b0, key4) ← emitImtU64As4 b keyW
+    let (b1, baseIdx, capIdx) := emitImtBaseCap b0
+    let cmdIdx := b1.cmds.size
+    let b2 := {
+      b1 with
+        cmds := b1.cmds.push
+          (.containsOtherUserIMTContractStateValue
+            (UInt64.ofNat uIdx) (UInt64.ofNat cIdx)
+            (UInt64.ofNat baseIdx) (UInt64.ofNat capIdx)
+            key4 imtDefaultTreeHeight)
+    }
+    let (b3, w) := pushTarget b2 .getStateCommandResultSingle #[UInt64.ofNat cmdIdx]
+    let getDefStep := b3.defs.size - 1
+    let b4 := { b3 with res := b3.res.push getDefStep }
+    pure (pushImtMemo b4 5 kIdx memoVal w, w)
+
+/-- Deterministic FNV-1a 64-bit hash → Goldilocks Felt, used for the
+    external-call qualified-name component hashes. -/
+def hashComponentFelt (s : String) : UInt64 := Id.run do
+  let prime : UInt64 := 1099511628211
+  let mut h : UInt64 := 14695981039346656037
+  for c in s.toList do
+    h := (h ^^^ c.toNat.toUInt64) * prime
+  pure (UInt64.ofNat (h.toNat % 0xFFFFFFFF00000001))
+
+/-- DPN-6 PARTIAL: void externalCall → InvokeExternalContractFunctionSync.
+    Hashed static QN components; num_outputs=0 (no response-binding). -/
+private def emitVoidExternalCall (b : BuilderV1) (writeCond : WireV1)
+    (callee : Array String) (argWires : Array WireV1) :
+    Except String BuilderV1 := do
+  unless callee.size ≥ 2 do
+    planError
+      "external callee must have ≥2 qualified-name components (callee.method)"
+  let targetHash := hashComponentFelt callee[0]!
+  let methodHash := hashComponentFelt callee[1]!
+  let (b1, tidW) := emitConstTarget b targetHash
+  let (b2, midW) := emitConstTarget b1 methodHash
+  let ti ← asTargetIndex tidW
+  let mi ← asTargetIndex midW
+  let mut args : Array UInt64 := #[]
+  for aw in argWires do
+    let ai ← asTargetIndex aw
+    args := args.push (UInt64.ofNat ai)
+  pure {
+    b2 with
+      cmds := b2.cmds.push
+        (.invokeExternalContractFunctionSync
+          writeCond.encoded (UInt64.ofNat ti) (UInt64.ofNat mi) args 0)
+      -- Official simulate: resolution = definition step, after the hash
+      -- Constant defs and arg wires exist.
+      res := b2.res.push b2.defs.size
+  }
+
+/-- DPN-6: emitEvent → `DPNEventRecord`.
+    Event name is source metadata only and is not encoded in the record. -/
+private def emitEventRecord (b : BuilderV1) (writeCond : WireV1)
+    (argWires : Array WireV1) : Except String BuilderV1 := do
+  -- Allocate one set of identity-context operations per emitted event.
+  let (b1, cpW) := pushValuelessTarget b .getCheckpointId
+  let (b2, userW) := pushValuelessTarget b1 .getUserId
+  let (b3, cidW) := pushValuelessTarget b2 .getContractId
+  let (b4, cpG) ← gateTargetUnderCond b3 writeCond cpW
+  let (b5, userG) ← gateTargetUnderCond b4 writeCond userW
+  let (b6, cidG) ← gateTargetUnderCond b5 writeCond cidW
+  let mut bCur := b6
+  let mut data : Array UInt64 := #[]
+  for aw in argWires do
+    let (bG, gw) ← gateTargetUnderCond bCur writeCond aw
+    bCur := bG
+    let ti ← asTargetIndex gw
+    data := data.push (UInt64.ofNat ti)
+  let cpIdx ← asTargetIndex cpG
+  let userIdx ← asTargetIndex userG
+  let cidIdx ← asTargetIndex cidG
+  let eventRec : EventRecordV1 := {
+    condition := writeCond.encoded
+    checkpointId := UInt64.ofNat cpIdx
+    userId := UInt64.ofNat userIdx
+    contractId := UInt64.ofNat cidIdx
+    data
+  }
+  pure { bCur with events := bCur.events.push eventRec }
+
 /-- Lower a Plan Expr into a circuit wire under the psy-dpn-v1 admit surface. -/
 partial def lowerExprV1 (b : BuilderV1) (params : Array WireV1) :
     Expr → Except String (BuilderV1 × WireV1)
@@ -690,6 +1012,84 @@ partial def lowerExprV1 (b : BuilderV1) (params : Array WireV1) :
   | .ctxSessionProofTreeRoot =>
       -- Must be HashOut-typed; Target-only path panics in official software eval.
       pure (emitHashOutLimb0 b .getSessionProofTreeRoot)
+  | .hashNoPad args => do
+      -- ADR-0039: first HashOut limb (scalar ABI). Full 4-limb uses hashOutLimb.
+      unless args.size >= 1 && args.size <= 8 do
+        planError s!"hashNoPad arity must be 1..8, got {args.size}"
+      let mut bCur := b
+      let mut ins : Array UInt64 := #[]
+      for a in args do
+        let (b1, w) ← lowerExprV1 bCur params a
+        let ti ← asTargetIndex w
+        bCur := b1
+        ins := ins.push (UInt64.ofNat ti)
+      let (b2, limbs) := emitHashOutFull bCur 0 .hashNoPad ins
+      match limbs[0]? with
+      | some w => pure (b2, w)
+      | none => planError "hashNoPad limb0 missing"
+  | .hashPad args => do
+      -- hashPad: Target-typed scalar (official software eval is emit-only no-op).
+      unless args.size ≥ 1 && args.size ≤ 8 do
+        planError s!"hashPad arity must be 1..8, got {args.size}"
+      let mut bCur := b
+      let mut ins : Array UInt64 := #[]
+      for a in args do
+        let (b1, w) ← lowerExprV1 bCur params a
+        let ti ← asTargetIndex w
+        bCur := b1
+        ins := ins.push (UInt64.ofNat ti)
+      pure (pushTarget bCur .hashPad ins)
+  | .hashTwoToOne args => do
+      unless args.size == 8 do
+        planError s!"hashTwoToOne requires 8 limbs, got {args.size}"
+      let mut bCur := b
+      let mut ins : Array UInt64 := #[]
+      for a in args do
+        let (b1, w) ← lowerExprV1 bCur params a
+        let ti ← asTargetIndex w
+        bCur := b1
+        ins := ins.push (UInt64.ofNat ti)
+      let (b2, limbs) := emitHashOutFull bCur 2 .hashTwoToOne ins
+      match limbs[0]? with
+      | some w => pure (b2, w)
+      | none => planError "hashTwoToOne limb0 missing"
+  | .keccak256 args => do
+      -- keccak256: Target-typed first-word ABI (official stores U32TargetArray,
+      -- not HashOut arrays — Array4 full ABI is not admitted for keccak).
+      unless args.size ≥ 1 && args.size ≤ 16 do
+        planError s!"keccak256 arity must be 1..16, got {args.size}"
+      let mut bCur := b
+      let mut ins : Array UInt64 := #[]
+      for a in args do
+        let (b1, w) ← lowerExprV1 bCur params a
+        let ti ← asTargetIndex w
+        bCur := b1
+        ins := ins.push (UInt64.ofNat ti)
+      pure (pushTarget bCur .keccak256 ins)
+  | .imtGet k => do
+      let (b1, kw) ← lowerExprV1 b params k
+      emitImtGet b1 kw
+  | .imtContains k => do
+      let (b1, kw) ← lowerExprV1 b params k
+      emitImtContains b1 kw
+  | .imtSet k v => do
+      let (b1, kw) ← lowerExprV1 b params k
+      let (b2, vw) ← lowerExprV1 b1 params v
+      emitImtSet b2 kw vw
+  | .imtGetExternal c k => do
+      let (b1, cw) ← lowerExprV1 b params c
+      let (b2, kw) ← lowerExprV1 b1 params k
+      emitImtGetExternal b2 cw kw
+  | .imtGetOther u c k => do
+      let (b1, uw) ← lowerExprV1 b params u
+      let (b2, cw) ← lowerExprV1 b1 params c
+      let (b3, kw) ← lowerExprV1 b2 params k
+      emitImtGetOther b3 uw cw kw
+  | .imtContainsOther u c k => do
+      let (b1, uw) ← lowerExprV1 b params u
+      let (b2, cw) ← lowerExprV1 b1 params c
+      let (b3, kw) ← lowerExprV1 b2 params k
+      emitImtContainsOther b3 uw cw kw
 
 /-- Result of lowering a statement sequence: return wires (empty = unit). -/
 structure StmtResultV1 where
@@ -768,6 +1168,72 @@ partial def lowerStmtsV1 (b : BuilderV1) (params : Array WireV1)
           | false, false =>
               planError "multiple return values in sequence"
 
+      | .forLoop start endExclusive maxIter body => do
+          unless maxIter ≤ maxUnrollBudget do
+            planError s!"bounded for maxIterations={maxIter} exceeds unroll \
+budget {maxUnrollBudget} (no while/unbounded; PSY-LOOP)"
+          let (b1, startW) ← lowerExprV1 b params start
+          let (b2, endW) ← lowerExprV1 b1 params endExclusive
+          let si ← asTargetIndex startW
+          let ei ← asTargetIndex endW
+          -- if start < end { assert end - start <= maxIter }
+          let (b3, rangeNonempty) :=
+            pushBool b2 .lt #[UInt64.ofNat si, UInt64.ofNat ei]
+          let (b4, span) :=
+            pushTarget b3 .sub #[UInt64.ofNat ei, UInt64.ofNat si]
+          let (b5, maxLit) := emitLiteralU64 b4 (UInt64.ofNat maxIter)
+          let mi ← asTargetIndex maxLit
+          let (b6, fits) :=
+            pushBool b5 .lte #[UInt64.ofNat span.rawIndex, UInt64.ofNat mi]
+          let (b7, gatedFits) ← emitSelect b6 rangeNonempty fits (trueWire b6)
+          let b8 := {
+            b7 with
+              asserts := b7.asserts.push {
+                left := gatedFits.encoded
+                right := encodeIndexedId .bool b7.trueBool
+                message := "boundExceeded"
+              }
+          }
+          -- Unroll: for k in 0..maxIter-1:
+          --   i = start + k; if i < end { body with loopVar = i }
+          let mut bCur := b8
+          for k in [0:maxIter] do
+            let (bK, kLit) := emitLiteralU64 bCur (UInt64.ofNat k)
+            let ki ← asTargetIndex kLit
+            let (bI, iW) :=
+              pushTarget bK .add #[UInt64.ofNat si, UInt64.ofNat ki]
+            let ii ← asTargetIndex iW
+            let (bG, stepGuard) :=
+              pushBool bI .lt #[UInt64.ofNat ii, UInt64.ofNat ei]
+            let (bC, stepCond) ← emitBoolAnd bG writeCond stepGuard
+            let bLoop := { bC with loopVars := bC.loopVars.push iW }
+            let bodyRes ← lowerStmtsV1 bLoop params stepCond body.toList
+            unless bodyRes.returnWires.isEmpty do
+              planError "return inside bounded for is not admitted in this slice"
+            -- Pop loop var
+            bCur := { bodyRes.builder with loopVars := bC.loopVars }
+          let cont ← lowerStmtsV1 bCur params writeCond rest
+          pure cont
+      | .emitEvent _name args => do
+          let mut bCur := b
+          let mut argWires : Array WireV1 := #[]
+          for a in args do
+            let (b1, w) ← lowerExprV1 bCur params a
+            bCur := b1
+            argWires := argWires.push w
+          let b2 ← emitEventRecord bCur writeCond argWires
+          lowerStmtsV1 b2 params writeCond rest
+      | .externalCall callee args => do
+          -- DPN-6 PARTIAL: void sync call only (result-bearing FC at Plan).
+          let mut bCur := b
+          let mut argWires : Array WireV1 := #[]
+          for a in args do
+            let (b1, w) ← lowerExprV1 bCur params a
+            bCur := b1
+            argWires := argWires.push w
+          let b2 ← emitVoidExternalCall bCur writeCond callee argWires
+          lowerStmtsV1 b2 params writeCond rest
+
 /-- Encode return wires as circuit_outputs (target raw index; bool/u32 encoded). -/
 private def encodeOutputs (wires : Array WireV1) : Array UInt64 :=
   wires.map fun
@@ -799,7 +1265,7 @@ def lowerFunctionGeneralV1 (fn : PlanFunction) (multiLeaf : Bool) :
     stateCommandResolutionIndices := res.builder.res
     assertions := res.builder.asserts
     definitions := res.builder.defs
-    events := #[]
+    events := res.builder.events
   }
 
 /-- Classify a single PlanFunction into a DPN template or general lower. -/

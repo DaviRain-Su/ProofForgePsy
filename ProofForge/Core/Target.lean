@@ -59,7 +59,7 @@ partial def projectVal
   | .ext kind operands => do
       let targetKind ← registration.projectValExt kind
       let targetOperands ← operands.mapM (projectVal registration)
-      unless targetOperands.size == registration.valArity targetKind do
+      unless targetOperands.size <= registration.valArity targetKind do
         throw s!"extract/ir: malformed {registration.name} value extension"
       return .ext targetKind targetOperands
 
@@ -69,6 +69,10 @@ partial def projectOp
   | .letLocal i value => return .letLocal i (← projectVal registration value)
   | .joinLocal i => pure (.joinLocal i)
   | .setLocal i value => return .setLocal i (← projectVal registration value)
+  | .emitEvent name payload =>
+      return .emitEvent name (← projectVal registration payload)
+  | .externalCall callee args =>
+      return .externalCall callee (← args.mapM (projectVal registration))
   | .checkedAddU64 lhs rhs =>
       return .checkedAddU64 (← projectVal registration lhs) (← projectVal registration rhs)
   | .checkedSubU64 lhs rhs =>
@@ -164,6 +168,10 @@ partial def rewriteOpValues
     Core.Ops.Op ValExt OpExt → Except String (Core.Ops.Op ValExt OpExt)
   | .letLocal i value => return .letLocal i (← rewriteValRoots rewriteRoot value)
   | .joinLocal i => pure (.joinLocal i)
+  | .emitEvent name payload =>
+      return .emitEvent name (← rewriteValRoots rewriteRoot payload)
+  | .externalCall callee args =>
+      return .externalCall callee (← args.mapM (rewriteValRoots rewriteRoot))
   | .setLocal i value => return .setLocal i (← rewriteValRoots rewriteRoot value)
   | .checkedAddU64 lhs rhs =>
       return .checkedAddU64 (← rewriteValRoots rewriteRoot lhs)

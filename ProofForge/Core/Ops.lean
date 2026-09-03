@@ -156,6 +156,12 @@ inductive Op (ValExt : Type) (OpExt : Type → Type) where
   | okState (value : Val ValExt)
   | errorOverflow
   | errorNamed (name : String)
+  /-- DPN event record (Psy target effect; name is source metadata). Other
+      targets reject it at projection time. -/
+  | emitEvent (name : String) (payload : Val ValExt)
+  /-- Void synchronous external call (Psy DPN-6 PARTIAL): hashed static
+      qualified name `callee.method`, `numOutputs = 0`. -/
+  | externalCall (callee : Array String) (args : Array (Val ValExt))
   | errorTyped (frame : ErrorFrame (Val ValExt))
   | returnU64 (value : Val ValExt)
   | returnState (value : Val ValExt)
@@ -177,7 +183,8 @@ partial def Val.wellFormed (arity : Ext → Nat) : Val Ext → Bool
       lhs.wellFormed arity && rhs.wellFormed arity &&
         thn.wellFormed arity && els.wellFormed arity
   | .ext kind operands =>
-      operands.size == arity kind && operands.all (wellFormed arity)
+      -- `arity` is the maximum admitted operand count for the kind.
+      operands.size <= arity kind && operands.all (wellFormed arity)
 
 /-- Walk common control flow while allowing the caller to inspect target extension payloads. -/
 partial def Op.wellFormed (arity : ValExt → Nat)
@@ -194,6 +201,8 @@ partial def Op.wellFormed (arity : ValExt → Nat)
       lhs.wellFormed arity && rhs.wellFormed arity &&
         thn.all (wellFormed arity validExt) && els.all (wellFormed arity validExt)
   | .forBody _ body => body.all (wellFormed arity validExt)
+  | .emitEvent _ payload => payload.wellFormed arity
+  | .externalCall _ args => args.all (·.wellFormed arity)
   | .indexSetLeaf _ idx value _ _ => idx.wellFormed arity && value.wellFormed arity
   | .indexSet _ idx value _ _ => idx.wellFormed arity && value.wellFormed arity
   | .ext payload => validExt payload

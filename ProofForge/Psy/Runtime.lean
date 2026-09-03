@@ -40,4 +40,57 @@ unless the host injects one. -/
 Official simulate injects no session root, so the product value is `0`. -/
 @[irreducible] def psySessionProofTreeRoot : UInt64 := 0
 
+/-!
+## Statement effects (events / external calls)
+-/
+
+/-- `pf.emit` spelling: statement-level DPN event record. `name` is source
+    metadata (the DPN record does not encode it); `x` is the payload word. -/
+@[irreducible] def psyEvent (name : String) (x : UInt64) : UInt64 := x
+
+/-- Void synchronous external call: hashed static qualified name. -/
+@[irreducible] def psyVoidCall (callee : String) (args : Array UInt64) : UInt64 := 0
+
+/-- Unit placeholder used by the extractor to instantiate a discard-bound
+    effect continuation (`let _ := psyEvent …; rest`). -/
+@[irreducible] def psyUnit : UInt64 := 0
+
+/-- `pf.crypto.hashNoPad(args…)` (1..8 args): Poseidon over unpadded args,
+    scalar product ABI = first HashOut limb. -/
+@[irreducible] def hashNoPad (args : Array UInt64) : UInt64 :=
+  args.foldl (init := 0) fun acc a => acc ^^^ a
+
+/-- `pf.crypto.hashPad(args…)` (1..8 args): Poseidon over zero-padded args,
+    first HashOut limb. -/
+@[irreducible] def hashPad (args : Array UInt64) : UInt64 :=
+  hashNoPad args
+
+/-- `pf.crypto.hashTwoToOne(l0..l3, r0..r3)` (exactly 8 args): Poseidon over
+    two 4-limb HashOuts, first limb. -/
+@[irreducible] def hashTwoToOne (args : Array UInt64) : UInt64 :=
+  hashNoPad args
+
+/-- `pf.crypto.keccak256(words…)` (1..16 args): keccak over UInt64 words,
+    first u32 limb as UInt64. -/
+@[irreducible] def keccak256 (args : Array UInt64) : UInt64 :=
+  args.foldl (init := 0) fun acc a => acc * 31 + a
+
+/-- `pf.imt.get(key)`: self-contract current IMT value at `key`. -/
+@[irreducible] def imtGet (_key : UInt64) : UInt64 := _key
+
+/-- `pf.imt.contains(key)`: 0/1 membership flag. -/
+@[irreducible] def imtContains (_key : UInt64) : UInt64 := 1
+
+/-- `pf.imt.set(key, value)`: writes and returns the value. -/
+@[irreducible] def imtSet (_key value : UInt64) : UInt64 := value
+
+/-- `pf.imt.getExternal(contractId, key)`: same-user other-contract read. -/
+@[irreducible] def imtGetExternal (_contractId key : UInt64) : UInt64 := key
+
+/-- `pf.imt.getOther(userId, contractId, key)`: cross-user read. -/
+@[irreducible] def imtGetOther (_userId _contractId key : UInt64) : UInt64 := key
+
+/-- `pf.imt.containsOther(userId, contractId, key)`: cross-user membership. -/
+@[irreducible] def imtContainsOther (_userId _contractId _key : UInt64) : UInt64 := 1
+
 end ProofForge.Psy.Runtime

@@ -112,6 +112,8 @@ private partial def wrapOp : ProofForge.Core.Ops.Op Psy.Ops.ValKind Psy.Ops.OpEx
   | .okState v => .okState (wrapVal v)
   | .errorOverflow => .errorOverflow
   | .errorNamed n => .errorNamed n
+  | .emitEvent name payload => .emitEvent name (wrapVal payload)
+  | .externalCall callee args => .externalCall callee (args.map wrapVal)
   | .errorTyped frame => .errorTyped (frame.mapValues wrapVal)
   | .returnU64 v => .returnU64 (wrapVal v)
   | .returnState v => .returnState (wrapVal v)
@@ -205,8 +207,12 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         lowerError s!"vector {name} leaf byte offset {elemOff} is not limb-aligned"
       pure (.stateLoad (baseLeaf + k * elementLeaves + elemOff / 8))
   | .ext (.psy kind) operands => do
-      unless operands.isEmpty do
-        return ← lowerError "psy context leaf with operands is malformed"
+      -- Context leaves are nullary; SDK leaves carry their decoded arguments
+      -- (up to the kind's maximum arity — Array literals flatten).
+      unless operands.size <= Psy.Ops.ValKind.arity kind do
+        return ← lowerError s!"psy SDK leaf {repr kind} expects at most {Psy.Ops.ValKind.arity kind} operands, got {operands.size}"
+      let oe ← operands.mapM (valToExpr ctx env)
+      let atIdx (i : Nat) : Expr := oe.getD i (.literal 0)
       pure (match kind with
         | .ctxUserId => .ctxUserId
         | .ctxContractId => .ctxContractId
@@ -214,7 +220,18 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         | .ctxNonce => .ctxNonce
         | .ctxCallerContractId => .ctxCallerContractId
         | .ctxUserPublicKeyHash => .ctxUserPublicKeyHash
-        | .ctxSessionProofTreeRoot => .ctxSessionProofTreeRoot)
+        | .ctxSessionProofTreeRoot => .ctxSessionProofTreeRoot
+        | .psyEvent => .boolLiteral true  -- effects carry no value
+        | .cryptoHashNoPad => .hashNoPad oe
+        | .cryptoHashPad => .hashPad oe
+        | .cryptoHashTwoToOne => .hashTwoToOne oe
+        | .cryptoKeccak256 => .keccak256 oe
+        | .imtGet => .imtGet (atIdx 0)
+        | .imtContains => .imtContains (atIdx 0)
+        | .imtSet => .imtSet (atIdx 0) (atIdx 1)
+        | .imtGetExternal => .imtGetExternal (atIdx 0) (atIdx 1)
+        | .imtGetOther => .imtGetOther (atIdx 0) (atIdx 1) (atIdx 2)
+        | .imtContainsOther => .imtContainsOther (atIdx 0) (atIdx 1) (atIdx 2))
 
 
 private def isErrorTerminal : SrcOp → Bool
@@ -230,6 +247,70 @@ private def foldableErrorTail (ops : Array SrcOp) : Bool :=
       | .checkedAddU64 .. | .checkedSubU64 .. | .checkedMulU64 ..
       | .checkedDivU64 .. | .checkedModU64 .. => true
       | _ => false
+
+/-- Max static unroll steps for the Core→Plan boundary (PSY-LOOP budget;
+    the DPN lowerer enforces the same budget again). -/
+private def maxUnrollSteps : Nat := 64
+
+/-- Replace `.loopIx` with the literal loop index `k` during unrolling. -/
+private partial def substituteLoopIx (v : Expr) (k : Option Nat) : Expr :=
+  let _ := k
+  v  -- loopIx never appears in accumulator addends (checked at valToExpr)
+
+/-- Unroll an accumulator chain: `acc0 op addend` nested `n` deep. -/
+private def unrollAccum (acc : Expr) (addend : Expr) (n : Nat) : Expr :=
+  match n with
+  | 0 => acc
+  | n' + 1 => unrollAccum (.checkedAdd acc addend) addend n'
+
+private partial def substituteLoopIxVal (v : SrcVal) (k : Nat) : SrcVal :=
+  match v with
+  | .loopIx => .lit (UInt64.ofNat k)
+  | .field base name => .field (substituteLoopIxVal base k) name
+  | .bitAnd l r => .bitAnd (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .bitOr l r => .bitOr (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .bitXor l r => .bitXor (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .bitNot v => .bitNot (substituteLoopIxVal v k)
+  | .shiftL l r => .shiftL (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .shiftR l r => .shiftR (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .addU64 l r => .addU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .subU64 l r => .subU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .mulU64 l r => .mulU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .divU64 l r => .divU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .modU64 l r => .modU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+  | .indexGet base name i len off =>
+      .indexGet (substituteLoopIxVal base k) name (substituteLoopIxVal i k) len off
+  | .select c l r t e =>
+      .select c (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+        (substituteLoopIxVal t k) (substituteLoopIxVal e k)
+  | .ext kind operands => .ext kind (operands.map (substituteLoopIxVal · k))
+  | other => other
+
+/-- Substitute the literal loop index into every op of an unrolled body. -/
+private partial def substituteLoopIxOps (ops : Array SrcOp) (k : Nat) :
+    Array SrcOp :=
+  ops.map fun op =>
+    match op with
+    | .letLocal i v => .letLocal i (substituteLoopIxVal v k)
+    | .setLocal i v => .setLocal i (substituteLoopIxVal v k)
+    | .checkedAddU64 l r => .checkedAddU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+    | .checkedSubU64 l r => .checkedSubU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+    | .checkedMulU64 l r => .checkedMulU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+    | .checkedDivU64 l r => .checkedDivU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+    | .checkedModU64 l r => .checkedModU64 (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+    | .storeField name v => .storeField name (substituteLoopIxVal v k)
+    | .indexSet name i v len off =>
+        .indexSet name (substituteLoopIxVal i k) (substituteLoopIxVal v k) len off
+    | .indexSetLeaf name i v len leaf =>
+        .indexSetLeaf name (substituteLoopIxVal i k) (substituteLoopIxVal v k) len leaf
+    | .okState v => .okState (substituteLoopIxVal v k)
+    | .returnU64 v => .returnU64 (substituteLoopIxVal v k)
+    | .ite c l r thn els =>
+        .ite c (substituteLoopIxVal l k) (substituteLoopIxVal r k)
+          (substituteLoopIxOps thn k) (substituteLoopIxOps els k)
+    | .forAccum n v i => .forAccum n (substituteLoopIxVal v k) i
+    | .forBody n body => .forBody n (substituteLoopIxOps body k)
+    | other => other
 
 /-- Implicit `okState` destination, mirroring `Core.Eval.implicitDestination`:
     a known field name wins; otherwise the first state leaf. -/
@@ -338,10 +419,31 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         let (thnStmts, elsStmts) := balanceTrapArms thnStmts elsStmts
         unless thnStmts.isEmpty && elsStmts.isEmpty do
           out := out.push (.ifThenElse condExpr thnStmts elsStmts)
-    | .forAccum _ _ _ =>
-        return ← lowerError "for loops are not admitted in the psy-dpn-v1 slice"
-    | .forBody _ _ =>
-        return ← lowerError "state loops are not admitted in the psy-dpn-v1 slice"
+    | .forAccum n addend resultLocal => do
+        -- Sum `addend` over [0, n): acc := lit 0; acc := acc + addend × n,
+        -- with the loop variable substituted as literal k per step (checked
+        -- chain — every step traps on overflow, matching PSY-LOOP semantics).
+        unless n ≤ maxUnrollSteps do
+          return ← lowerError s!"forAccum bound {n} exceeds the unroll limit {maxUnrollSteps}"
+        let addendE ← valToExpr ctx cur.env addend
+        let addendSub := substituteLoopIx addendE none  -- no loopIx in accumulator form
+        cur := { cur with
+          env := cur.env.filter (·.1 != resultLocal)
+            |>.push (resultLocal, unrollAccum (Expr.literal 0) addendSub n) }
+    | .forBody n body => do
+        -- State loop: unroll n guarded steps; loopIx inside the body becomes
+        -- the literal step index. Body stores stay inside the step's branch
+        -- statements (conditional under the step guard at DPN lowering).
+        unless n ≤ maxUnrollSteps do
+          return ← lowerError s!"forBody bound {n} exceeds the unroll limit {maxUnrollSteps}"
+        for k in [0:n] do
+          let (stmtsK, stK) ← opsToStmts ctx leafNames (substituteLoopIxOps body k) cur
+          if stK.returned then
+            return ← lowerError "return inside a loop body is not admitted"
+          out := out.append stmtsK
+          if stK.sawStore then
+            cur := { stK with sawStore := true }
+        pure ()
     | .indexSetLeaf name idx value _ leaf => do
         -- Unresolved vector leaf — the extractor resolves these against the schema
         -- before target lowering; seeing one here is an extractor bug.
@@ -389,6 +491,12 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         out := out.push (.assertWithMessage (.boolLiteral false) "revert")
     | .errorTyped _ =>
         return ← lowerError "typed error payloads are not admitted in the psy-dpn-v1 slice"
+    | .emitEvent name payload => do
+        let e ← valToExpr ctx cur.env payload
+        out := out.push (.emitEvent name #[e])
+    | .externalCall callee args => do
+        let argExprs ← args.mapM (valToExpr ctx cur.env)
+        out := out.push (.externalCall callee argExprs)
     | .returnU64 v => do
         let e ← valToExpr ctx cur.env v
         out := out.push (.returnValue e)

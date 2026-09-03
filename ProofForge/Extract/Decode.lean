@@ -92,6 +92,58 @@ private partial def asVal (env : Environment) (fuel : Nat) (e : Expr) : Option O
         | some n => asValNamed env fuel' n e
         | none => none
 
+/-- Build a psy SDK application leaf: decode every user-visible argument
+    into the leaf's operand list. SDK wrappers take their value args last
+    (typeclass instances precede them), so all app args are decoded in order. -/
+private partial def psyAppLeaf (kind : Psy.Ops.ValKind)
+    (env : Environment) (fuel : Nat) (e : Expr) : Option Ops.Val :=
+  -- SDK wrappers put their value arguments last (typeclass instances
+  -- precede them). Decode from the end while values succeed. An argument
+  -- that is an `Array UInt64` literal (possibly List.toArray/Array.mk
+  -- wrapped) flattens into individual leaf operands.
+  let rec decodeFrom (fuel : Nat) (idx : Nat) (acc : Array Ops.Val) :
+      Option Ops.Val :=
+    if idx == 0 then some (Ops.psyLeafWith kind acc)
+    else
+      let e := e.getAppArgs[idx - 1]!
+      match asVal env fuel e with
+      | some v => decodeFrom fuel (idx - 1) (acc.push v)
+      | none =>
+          match psyArrayLitOf env fuel e with
+          | some vs => decodeFrom fuel (idx - 1) (acc ++ vs)
+          | none => none
+  let n := e.getAppArgs.size
+  (decodeFrom fuel n #[]).map (fun leaf =>
+    match leaf with
+    | .ext k operands =>
+        -- collected back-to-front → reverse into argument order
+        .ext k operands.reverse
+    | other => other)
+
+/-- Flatten an `Array UInt64` literal expression into leaf values. -/
+private partial def psyArrayLitOf (env : Environment) (fuel : Nat) (e0 : Expr) :
+    Option (Array Ops.Val) :=
+  let rec go (fuel : Nat) (e : Expr) (acc : Array Ops.Val) : Option (Array Ops.Val) :=
+    match fuel with
+    | 0 => none
+    | fuel' + 1 =>
+        let e := peelLets (strip e)
+        if isConstNamed e ``List.nil then some acc
+        else if isConstNamed e ``List.cons && e.getAppArgs.size >= 2 then
+          let args := e.getAppArgs
+          match asVal env fuel' args[args.size - 2]! with
+          | some v => go fuel' args[args.size - 1]! (acc.push v)
+          | none => none
+        else none
+  -- Unwrap List.toArray / Array.mk around the cons spine.
+  let e := peelLets (strip e0)
+  let inner :=
+    if (e.getAppFn.constName? == some ``List.toArray ||
+        e.getAppFn.constName? == some ``Array.mk) && e.getAppArgs.size >= 1 then
+      e.getAppArgs[e.getAppArgs.size - 1]!
+    else e
+  go fuel inner #[]
+
 /-- The `constName` dispatch arm of `asVal`, extracted so the recursive value decoder
 stays navigable. `fuel` here is the caller's already-decremented budget. -/
 private partial def asValNamed (env : Environment) (fuel : Nat) (n : Name) (e : Expr) :
@@ -281,6 +333,38 @@ private partial def asValNamed (env : Environment) (fuel : Nat) (n : Name) (e : 
       else some (.field b s!"{n}_tag")
     | some b => some (.field b s!"slot_tag")
     | none => none
+  else if isConstNamed e ``ProofForge.Psy.Runtime.hashNoPad &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoHashNoPad env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.hashPad &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoHashPad env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.hashTwoToOne &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoHashTwoToOne env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.keccak256 &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoKeccak256 env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtGet &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .imtGet env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtContains &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .imtContains env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtSet &&
+      e.getAppArgs.size ≥ 1 then
+    -- imtSet returns the value (product ABI); the leaf carries key+value
+    -- operands and the DPN lowerer emits SetIMTContractStateValue.
+    psyAppLeaf .imtSet env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtGetExternal &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .imtGetExternal env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtGetOther &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .imtGetOther env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.imtContainsOther &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .imtContainsOther env fuel e
   else if endsWith e ".psyUserId" || isConstNamed e ``ProofForge.Psy.Runtime.psyUserId then
     some .psyUserId
   else if endsWith e ".psyContractId" || isConstNamed e ``ProofForge.Psy.Runtime.psyContractId then
@@ -3126,6 +3210,76 @@ private def asInlineStateSuccess (env : Environment) (e : Expr) (localDepth : Na
       (deepScalars := deepScalars)
     return stores ++ returns
 
+/-- Decode an `Array UInt64` array literal (List/Array cons chain of UInt64
+    literals) into source values. -/
+private partial def decodeUInt64ArrayLit (env : Environment) (e : Expr) :
+    Option (Array Ops.Val) :=
+  let rec go (fuel : Nat) (e : Expr) (acc : Array Ops.Val) : Option (Array Ops.Val) :=
+    match fuel with
+    | 0 => none
+    | fuel' + 1 =>
+        let e := peelLets (strip e)
+        if isConstNamed e ``List.nil then some acc
+        else if isConstNamed e ``List.cons && e.getAppArgs.size ≥ 2 then
+          let args := e.getAppArgs
+          match asVal env fuel' args[args.size - 2]! with
+          | some v => go fuel' args[args.size - 1]! (acc.push v)
+          | none => none
+        else none
+  go 32 e #[]
+
+/-- psy SDK effect recognition (`ProofForge.Psy.Runtime.psyEvent` /
+    `psyVoidCall`). `psyEvent` lowercases to the DPN event record; the DPN
+    record itself does not encode the event name. -/
+private def psyEffectOf (env : Environment) (e : Expr) : Option Ops.Op :=
+  let e := peelLets (strip e)
+  if isConstNamed e ``ProofForge.Psy.Runtime.psyEvent && e.getAppArgs.size ≥ 1 then
+    let args := e.getAppArgs
+    let nameE := args[args.size - (if args.size ≥ 2 then 2 else 1)]!
+    let eventName :=
+      match nameE.getAppFn.constName? with
+      | some n => n.toString
+      | none =>
+          match nameE.consumeMData with
+          | .lit (.strVal s) => s
+          | _ => "Event"
+    let payload :=
+      if args.size ≥ 2 then (asVal env 8 args[args.size - 1]!).getD (.lit 0)
+      else .lit 0
+    some (.emitEvent "" payload)
+  else if isConstNamed e ``ProofForge.Psy.Runtime.psyVoidCall &&
+      e.getAppArgs.size ≥ 2 then
+    let args := e.getAppArgs
+    let calleeE := args[args.size - 2]!
+    let calleeName :=
+      match calleeE.consumeMData with
+      | .lit (.strVal s) => (s.splitOn ".").toArray
+      | _ => #[]
+    if calleeName.size ≥ 2 then
+      let payloadE := args[args.size - 1]!
+      match payloadE.consumeMData.getAppFn.constName? with
+      | some ``List.nil =>
+          some (.externalCall calleeName #[])
+      | _ =>
+          -- Array literal (possibly Array.mk-wrapped): decode elements.
+          let innerE :=
+            match payloadE.consumeMData.getAppFn.constName? with
+            | some ``Array.mk | some ``List.toArray =>
+                if payloadE.getAppArgs.size >= 1 then
+                  payloadE.getAppArgs[payloadE.getAppArgs.size - 1]!
+                else payloadE
+            | _ => payloadE
+          match decodeUInt64ArrayLit env innerE with
+          | some vs => some (.externalCall calleeName vs)
+          | none =>
+              match asVal env 8 payloadE with
+              | some v => some (.externalCall calleeName #[v])
+              | none => none
+    else
+      none
+  else
+    none
+
 private def decodePlain (env : Environment) (e : Expr) (stateful : Bool)
     (localDepth : Nat) (stateType? : Option Name := none) (deepScalars : Bool := false) :
     Except String (Array Ops.Op) :=
@@ -3135,7 +3289,14 @@ private def decodePlain (env : Environment) (e : Expr) (stateful : Bool)
   -- shorthand below, but decode one changed leaf explicitly when the declared State has siblings.
   let includeSingleStore := stateful || stateType?.any fun stateType =>
     (getStructureFields env stateType).size > 1
-  if let some (n, addend) := findForIn env e then
+  -- psy SDK effects: `psyEvent name x` → statement-level event op;
+  -- `psyVoidCall callee… args` → void external call. Both are recognized
+  -- before plain decode so they never degrade to closed value reads.
+  if let some op := psyEffectOf env e then
+    .ok (#[op] ++ (match findOkRet env e with
+      | some v => #[.returnU64 v]
+      | none => #[]))
+  else if let some (n, addend) := findForIn env e then
     .ok #[.forAccum n addend localDepth, .returnU64 (.local localDepth)]
   else if let some result := asYieldStores env e localDepth stateType? deepScalars then
     result
@@ -3492,6 +3653,16 @@ def decodeExpr (env : Environment) (fuel : Nat) (e : Expr)
           (stateType? := stateType?) (deepScalars := deepScalars)
     match strip e with
     | .letE _ ty value body _ =>
+      -- psy statement effects bound to a discard pattern (`let _ := …`)
+      -- sequence before the continuation.
+      if let some op := psyEffectOf env value then
+        let placeholder := mkApp (mkConst ``ProofForge.Psy.Runtime.psyUnit) (mkNatLit 0)
+        match decodeExpr env fuel' (body.instantiate1 placeholder)
+            (stateful := stateful) (preserveLocals := preserveLocals)
+            (localDepth := localDepth) (stateType? := stateType?)
+            (deepScalars := deepScalars) with
+        | .error r => return .error r
+        | .ok cont => return .ok (#[op] ++ cont)
       let effectful :=
         (findForIn env value).isSome || (findForBodyExpr env value).isSome
       let scalarControlProducer := isSequencedScalarProducer env ty value

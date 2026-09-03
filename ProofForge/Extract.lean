@@ -628,6 +628,8 @@ def extractMethod (env : Environment) (kind : Core.IR.MethodKind) (n : Name) :
       | .returnU64 v => .returnU64 (flipVal fuel' v)
       | .storeField n v => .storeField n (flipVal fuel' v)
       | .okState v => .okState (flipVal fuel' v)
+      | .emitEvent n v => .emitEvent n (flipVal fuel' v)
+      | .externalCall callee args => .externalCall callee (args.map (flipVal fuel'))
       | .checkedAddU64 l r => .checkedAddU64 (flipVal fuel' l) (flipVal fuel' r)
       | .checkedSubU64 l r => .checkedSubU64 (flipVal fuel' l) (flipVal fuel' r)
       | .checkedMulU64 l r => .checkedMulU64 (flipVal fuel' l) (flipVal fuel' r)
@@ -946,6 +948,8 @@ private def opFields : Ops.Op → Array FieldUse
   | .letLocal _ v => valFields v
   | .joinLocal _ => #[]
   | .setLocal _ v => valFields v
+  | .emitEvent _ v => valFields v
+  | .externalCall _ args => args.flatMap valFields
   | .checkedAddU64 l r => valFields l ++ valFields r
   | .checkedSubU64 l r => valFields l ++ valFields r
   | .checkedMulU64 l r => valFields l ++ valFields r
@@ -1016,6 +1020,8 @@ private def resolveVectorLeaves (p : IR.Program) : Except String IR.Program := d
       | .letLocal i v => return .letLocal i (← normalizeVal v)
       | .joinLocal i => pure (.joinLocal i)
       | .setLocal i v => return .setLocal i (← normalizeVal v)
+      | .emitEvent n v => return .emitEvent n (← normalizeVal v)
+      | .externalCall c args => return .externalCall c (← args.mapM normalizeVal)
       | .checkedAddU64 l r => return .checkedAddU64 (← normalizeVal l) (← normalizeVal r)
       | .checkedSubU64 l r => return .checkedSubU64 (← normalizeVal l) (← normalizeVal r)
       | .checkedMulU64 l r => return .checkedMulU64 (← normalizeVal l) (← normalizeVal r)
@@ -1084,6 +1090,8 @@ private partial def valEscapedArg (limit : Nat) : Ops.Val → Option Nat
 private partial def opEscapedArg (limit : Nat) : Ops.Op → Option Nat
   | .letLocal _ v => valEscapedArg limit v
   | .joinLocal _ => none
+  | .emitEvent _ v => valEscapedArg limit v
+  | .externalCall _ args => args.findSome? (valEscapedArg limit)
   | .setLocal _ v => valEscapedArg limit v
   | .checkedAddU64 l r | .checkedSubU64 l r | .checkedMulU64 l r
   | .checkedDivU64 l r | .checkedModU64 l r =>

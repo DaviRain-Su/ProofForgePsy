@@ -15,10 +15,38 @@ inductive ValKind where
   | ctxCallerContractId
   | ctxUserPublicKeyHash
   | ctxSessionProofTreeRoot
+  /-- DPN event record effect (event name is source metadata). -/
+  | psyEvent
+  /-- pf.crypto gadgets (scalar first-limb ABI). Operands carry the args. -/
+  | cryptoHashNoPad
+  | cryptoHashPad
+  | cryptoHashTwoToOne
+  | cryptoKeccak256
+  /-- IMT self-current pilot + external/other-user reads. `imtSet` carries
+      key+value operands and returns the value (product ABI). -/
+  | imtGet
+  | imtContains
+  | imtSet
+  | imtGetExternal
+  | imtGetOther
+  | imtContainsOther
   deriving BEq, Repr, Inhabited, DecidableEq
 
 def ValKind.arity : ValKind → Nat :=
-  fun _ => 0
+  fun kind =>
+    match kind with
+    | .ctxUserId | .ctxContractId | .ctxCheckpointId | .ctxNonce
+    | .ctxCallerContractId | .ctxUserPublicKeyHash
+    | .ctxSessionProofTreeRoot | .psyEvent => 0
+    -- Hash/IMT leaves carry their arguments as operands. The value is the
+    -- MAXIMUM admitted arity (the extractor flattens `Array UInt64`
+    -- literals into individual operands; projection checks ≤).
+    | .cryptoHashNoPad | .cryptoHashPad => 8
+    | .cryptoHashTwoToOne => 8
+    | .cryptoKeccak256 => 16
+    | .imtGet | .imtContains | .imtSet => 2
+    | .imtGetExternal => 2
+    | .imtGetOther | .imtContainsOther => 3
 
 abbrev Val := ProofForge.Core.Ops.Val ValKind
 abbrev Cmp := ProofForge.Core.Ops.Cmp
