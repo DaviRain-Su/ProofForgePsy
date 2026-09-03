@@ -1,5 +1,7 @@
 # ProofForge Psy
 
+[![CI](https://github.com/DaviRain-Su/ProofForgePsy/actions/workflows/ci.yml/badge.svg)](https://github.com/DaviRain-Su/ProofForgePsy/actions/workflows/ci.yml)
+
 [中文](README.zh-CN.md)
 
 A Lean 4 → PSY (DPN circuit) contract compiler. Mark entries with `@[pf_entry]`

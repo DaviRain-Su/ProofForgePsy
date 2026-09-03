@@ -1,5 +1,7 @@
 # ProofForge Psy
 
+[![CI](https://github.com/DaviRain-Su/ProofForgePsy/actions/workflows/ci.yml/badge.svg)](https://github.com/DaviRain-Su/ProofForgePsy/actions/workflows/ci.yml)
+
 [English](README.md)
 
 Lean 4 → PSY（DPN 电路）合约编译器。在普通 Lean 源码里用 `@[pf_entry]` 标记入口；
