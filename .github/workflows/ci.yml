@@ -98,6 +98,9 @@ jobs:
           key: lake-build-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-${{ github.sha }}
           restore-keys: lake-build-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-
 
+      - name: Build Examples (golden dependencies)
+        run: lake build Examples
+
       - name: Run Psy DPN golden suite
         run: |
           lake build psyGolden
