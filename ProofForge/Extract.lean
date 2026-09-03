@@ -1,0 +1,1269 @@
+import Lean
+import ProofForge.Extract.Ops
+import ProofForge.Profile
+import ProofForge.Attr
+import ProofForge.Core.Value
+import ProofForge.Psy.Runtime
+import ProofForge.Extract.Lexical
+import ProofForge.Extract.Decode
+
+open Lean
+
+namespace ProofForge.Extract
+
+def decodeBody (env : Environment) (e : Expr) (preserveLocals : Bool := false)
+    (stateType? : Option Name := none) :
+    Except String (Array Ops.Op) :=
+  let (_, body) := peelLams e
+  -- Canonicalize syntax-only aliases around control flow before shape decoding.
+  -- A method with structured-State sequencing also retains adjacent scalar lets so `decodeExpr`
+  -- can materialize bounded lookups instead of duplicating them through every later projection.
+  -- Storage effects need the same lexical boundary: a value captured before a write or external
+  -- call must not be substituted into that later effect and re-read after the mutation.
+  let hasStructuredState := containsStructuredStateLet env 128 body
+  let retainLets := hasStructuredState
+  let fullySubstituted := if retainLets then body else substLets 256 body
+  let body :=
+    if (unfoldUserHelper env fullySubstituted).isSome then fullySubstituted
+    else if retainLets then body else zetaPureHeadLets env 32 body
+  let body := if retainLets then body else substIteLets 256 body
+  decodeExpr env 128 body (preserveLocals := preserveLocals)
+    (stateType? := stateType?)
+
+private def writesOptionLeaf (fuel : Nat) (ops : Array Ops.Op) : Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    ops.any fun
+      | .okState (.field _ n) => n.endsWith "_tag" || n.endsWith "_p0"
+      | .okState (.lit _) => true
+      | .okState (.arg _) => true
+      | .storeField n _ => n.endsWith "_tag" || n.endsWith "_p0"
+      | .ite _ _ _ t f => writesOptionLeaf fuel' t || writesOptionLeaf fuel' f
+      | _ => false
+
+private def hasIte (ops : Array Ops.Op) : Bool :=
+  ops.any fun | .ite .. => true | _ => false
+
+/-- 可变入口必须有 checked 算术、Option 双叶，或比较 ite（窄宽上界）。 -/
+def decodeMutating (env : Environment) (e : Expr) (stateType? : Option Name := none) :
+    Except String (Array Ops.Op) := do
+  let ops ← decodeBody env e true stateType?
+  if Ops.hasCheckedArith ops || writesOptionLeaf 8 ops || hasIte ops ||
+      Ops.hasPsyEffect ops || Ops.hasLangOp ops ||
+        Ops.hasForAccum ops || Ops.hasIndexSet ops || Ops.hasStoreField ops then
+    return ops
+  else
+    throw "extract/unsupported: mutating method missing checked arith"
+
+private def codecScalarOfType (e : Expr) : Option Core.Codec.Scalar :=
+  match e.consumeMData.getAppFn.constName? with
+  | some ``Bool => some .boolean
+  | some ``UInt8 => some .uint8
+  | some ``UInt16 => some .uint16
+  | some ``UInt32 => some .uint32
+  | some ``UInt64 => some .uint64
+  | some n =>
+      if n == uint128Name then some .uint128
+      else if n == uint256Name then some .uint256
+      else if n == fixedBytesName then
+        (fixedBytesSize? e).map (.fixedBytes ·)
+      else none
+  | none => none
+
+private def legacyWidthOfScalar : Core.Codec.Scalar → Nat
+  | type => type.byteWidth
+
+private def widthOfType (e : Expr) : Option Nat :=
+  (codecScalarOfType e).map legacyWidthOfScalar
+
+/-- Derive a bounded logical codec shape without choosing Borsh, ABI, account, or storage layout. -/
+private partial def codecSchemaOfTypeAt (env : Environment) (fuel : Nat)
+    (ancestors : Array Name) (type : Expr) : Except String Core.Codec.Schema := do
+  if fuel == 0 then
+    throw "extract/unsupported: boundary schema nesting exceeds extractor limit"
+  let type := type.consumeMData
+  let type :=
+      match type.getAppFn.constName? with
+      | some name =>
+          match env.find? name with
+          | some (.defnInfo info) =>
+              if info.type.hasLooseBVars then type else info.value
+          | _ => type
+      | none => type
+  if let some scalar := codecScalarOfType type then
+    return .scalar scalar
+  let head := type.getAppFn.constName?
+  if head == some ``Unit || head == some ``PUnit then
+    return .unit
+  let args := type.getAppArgs
+  if head == some ``Prod then
+    unless args.size ≥ 2 do
+      throw "extract/unsupported: malformed Prod boundary type"
+    return .tuple #[
+      ← codecSchemaOfTypeAt env (fuel - 1) ancestors args[args.size - 2]!,
+      ← codecSchemaOfTypeAt env (fuel - 1) ancestors args[args.size - 1]!
+    ]
+  if head == some ``Option then
+    let some payload := args.back?
+      | throw "extract/unsupported: malformed Option boundary type"
+    return .option (← codecSchemaOfTypeAt env (fuel - 1) ancestors payload)
+  if head == some ``Vector then
+    unless args.size ≥ 2 do
+      throw "extract/unsupported: malformed Vector boundary type"
+    let some length := natLiteral? args[args.size - 1]!
+      | throw "extract/unsupported: Vector boundary length is not a literal"
+    let element ← codecSchemaOfTypeAt env (fuel - 1) ancestors args[args.size - 2]!
+    return .fixedArray length element
+  if head == some boundedVecName then
+    unless args.size ≥ 2 do
+      throw "extract/unsupported: malformed BoundedVec boundary type"
+    let some capacity := natLiteral? args[args.size - 1]!
+      | throw "extract/unsupported: BoundedVec boundary capacity is not a literal"
+    let element ← codecSchemaOfTypeAt env (fuel - 1) ancestors args[args.size - 2]!
+    return .boundedArray capacity element
+  if head == some boundedBytesName || head == some boundedStringName then
+    let some capacityExpr := args.back?
+      | throw "extract/unsupported: malformed bounded byte boundary type"
+    let some capacity := natLiteral? capacityExpr
+      | throw "extract/unsupported: bounded byte capacity is not a literal"
+    return if head == some boundedBytesName then .boundedBytes capacity else .boundedString capacity
+  if head == some ``Array then
+    throw "extract/unsupported: Array boundary is dynamic; use Vector or BoundedVec"
+  if head == some fixedBytesName then
+    throw "extract/unsupported: FixedBytes boundary size must be a literal in 1..32"
+  let some typeName := head
+    | throw "extract/unsupported: polymorphic boundary type"
+  unless isUserType env typeName || Attr.isBoundary env typeName do
+    throw s!"extract/unsupported: unsupported boundary type {typeName}"
+  if ancestors.contains typeName then
+    throw s!"extract/unsupported: recursive boundary type {typeName}"
+  let some (.inductInfo info) := env.find? typeName
+    | throw s!"extract/unsupported: malformed boundary type {typeName}"
+  if info.numParams != 0 || info.numIndices != 0 || !args.isEmpty then
+    throw s!"extract/unsupported: polymorphic boundary type {typeName}"
+  if info.isRec then
+    throw s!"extract/unsupported: recursive boundary type {typeName}"
+  if info.ctors.isEmpty then
+    throw s!"extract/unsupported: empty boundary type {typeName}"
+  let ancestors := ancestors.push typeName
+  if isStructure env typeName then
+    unless (getStructureParentInfo env typeName).isEmpty do
+      throw s!"extract/unsupported: boundary record {typeName} uses inheritance"
+    let fields := getStructureFields env typeName
+    if fields.isEmpty then
+      throw s!"extract/unsupported: boundary record {typeName} has no fields"
+    let mut schemas : Array (String × Core.Codec.Schema) := #[]
+    for field in fields do
+      if (isSubobjectField? env typeName field).isSome then
+        throw s!"extract/unsupported: boundary record {typeName} uses inheritance"
+      let some fieldType := fieldTypeExpr env typeName field
+        | throw s!"extract/unsupported: boundary field {typeName}.{field} has no type"
+      schemas := schemas.push (field.toString,
+        ← codecSchemaOfTypeAt env (fuel - 1) ancestors fieldType)
+    return .record typeName.toString schemas
+  let mut variants : Array (String × Core.Codec.Schema) := #[]
+  for ctorName in info.ctors do
+    let some (.ctorInfo ctor) := env.find? ctorName
+      | throw s!"extract/unsupported: malformed boundary constructor {ctorName}"
+    let mut payload : Array Core.Codec.Schema := #[]
+    for index in [:ctor.numFields] do
+      let some fieldType := forallDomainAt? 32 index ctor.type
+        | throw s!"extract/unsupported: boundary constructor {ctorName} has no field type"
+      payload := payload.push (← codecSchemaOfTypeAt env (fuel - 1) ancestors fieldType)
+    let payloadSchema :=
+      match payload.toList with
+      | [] => .unit
+      | [schema] => schema
+      | _ => .tuple payload
+    variants := variants.push (Core.IR.lastName ctorName.toString, payloadSchema)
+  return .enumeration typeName.toString 8 variants
+
+def codecSchemaOfType (env : Environment) (type : Expr) :
+    Except String Core.Codec.Schema := do
+  let schema ← codecSchemaOfTypeAt env 32 #[] type
+  match Core.Codec.validate schema with
+  | .ok _ => return schema
+  | .error reason => throw s!"extract/unsupported: {reason}"
+
+/-- User parameter domains. init includes every binder; mutate/view drop persisted State. -/
+private def inferParamTypeExprs (e : Expr) (kind : Core.IR.MethodKind) : Array Expr :=
+  let rec collect (fuel : Nat) (e : Expr) (acc : Array Expr) : Array Expr :=
+    match fuel with
+    | 0 => acc
+    | fuel' + 1 =>
+      match strip e with
+      | .lam _ type body _ => collect fuel' body (acc.push type)
+      | .letE _ _ _ body _ => collect fuel' body acc
+      | _ => acc
+  let types := collect 32 e #[]
+  match kind with
+  | .init => types
+  | .increment | .get => if types.isEmpty then #[] else types.extract 1 types.size
+
+private def inferParamSchemas (env : Environment) (e : Expr) (kind : Core.IR.MethodKind) :
+    Except String (Array Core.Codec.Schema) :=
+  (inferParamTypeExprs e kind).mapM (codecSchemaOfType env)
+
+/-- Scalar compatibility metadata is complete or absent; aggregates never masquerade as u64. -/
+private def scalarTypesOfSchemas (schemas : Array Core.Codec.Schema) :
+    Array Core.Codec.Scalar := Id.run do
+  let mut types := #[]
+  for schema in schemas do
+    match schema with
+    | .scalar type => types := types.push type
+    | _ => return #[]
+  return types
+
+private def logicalReturnSchema (env : Environment) (kind : Core.IR.MethodKind) (type : Expr) :
+    Except String Core.Codec.Schema := do
+  match kind with
+  | .init => return .unit
+  | .get => return ← codecSchemaOfType env type
+  | .increment =>
+      let args := type.consumeMData.getAppArgs
+      unless type.consumeMData.getAppFn.constName? == some ``Except && args.size ≥ 2 do
+        throw "extract/unsupported: mutating boundary must return Except Error (State × Result)"
+      let success := args[args.size - 1]!.consumeMData
+      let successArgs := success.getAppArgs
+      unless success.getAppFn.constName? == some ``Prod && successArgs.size ≥ 2 do
+        throw "extract/unsupported: mutating boundary must return Except Error (State × Result)"
+      return ← codecSchemaOfType env successArgs[successArgs.size - 1]!
+
+/-- How many UInt64 source limbs one static return element occupies. -/
+private partial def staticReturnLimbCount (schema : Core.Codec.Schema) : Except String Nat := do
+  match schema with
+  | .scalar type =>
+      unless Core.Codec.Scalar.isWellFormed type do
+        throw "extract/unsupported: bounded result has malformed scalar element"
+      let width := Core.Codec.Scalar.byteWidth type
+      unless 0 < width && width ≤ 32 do
+        throw "extract/unsupported: bounded result scalar exceeds 32-byte limb budget"
+      pure ((width + 7) / 8)
+  | .tuple items => do
+      let mut total := 0
+      for item in items do
+        total := total + (← staticReturnLimbCount item)
+      unless total ≤ 4 do
+        throw "extract/unsupported: bounded result tuple exceeds limb budget"
+      pure total
+  | .record _ fields => do
+      let mut total := 0
+      for field in fields do
+        total := total + (← staticReturnLimbCount field.2)
+      unless total ≤ 4 do
+        throw "extract/unsupported: bounded result record exceeds limb budget"
+      pure total
+  | .option (.scalar type) => do
+      unless Core.Codec.Scalar.isWellFormed type do
+        throw "extract/unsupported: tagged array Option payload is malformed"
+      let width := Core.Codec.Scalar.byteWidth type
+      unless 0 < width && width ≤ 32 do
+        throw "extract/unsupported: tagged array Option payload exceeds 32-byte limb budget"
+      let parts := (width + 7) / 8
+      unless parts == 1 do
+        throw "extract/unsupported: tagged array Option payload must be one limb"
+      pure 2
+  | .option _ =>
+      throw "extract/unsupported: tagged array Option requires a one-limb scalar payload"
+  | _ =>
+      throw "extract/unsupported: bounded result requires static scalar/tuple/record/option elements"
+
+/-- Expand one static element at `values[i]` into its fixed UInt64 return limbs. -/
+private def expandStaticElementReturns (root : Ops.Val) (capacity index : Nat)
+    (element : Core.Codec.Schema) : Except String (Array Ops.Op) := do
+  -- `indexGet`'s final argument is a limb-aligned *byte* offset so EVM ABI rewrite and SVM
+  -- Borsh rewrite share one Extract contract (`offset % 8 == 0`, limb := offset / 8). One-level
+  -- static products flatten through `staticLeaves` to one-limb scalar leaves; nested dynamics
+  -- stay fail-closed.
+  match element with
+  | .scalar _ =>
+      let parts ← staticReturnLimbCount element
+      let mut limbs : Array Ops.Op := #[]
+      for part in [0:parts] do
+        limbs := limbs.push
+          (.returnU64 (.indexGet root "values" (.lit (UInt64.ofNat index)) capacity (part * 8)))
+      pure limbs
+  | .tuple _ | .record _ _ => do
+      -- One-level static products: flatten to one-limb scalar leaves at byte offsets 0, 8, …
+      let leaves ← Core.Codec.staticLeaves element
+      unless !leaves.isEmpty do
+        throw "extract/unsupported: constructed bounded result element must contain a scalar"
+      for leaf in leaves do
+        unless (← staticReturnLimbCount (.scalar leaf.type)) == 1 do
+          throw "extract/unsupported: constructed bounded elements currently require one-limb scalar leaves"
+      let mut limbs : Array Ops.Op := #[]
+      for leafIdx in [0:leaves.size] do
+        limbs := limbs.push
+          (.returnU64 (.indexGet root "values" (.lit (UInt64.ofNat index)) capacity (leafIdx * 8)))
+      pure limbs
+  | .option (.scalar _) => do
+      -- Tagged Tuple v1 Option element: tag limb at byte 0, one-limb payload at byte 8.
+      let _ ← staticReturnLimbCount element
+      pure #[
+        .returnU64 (.indexGet root "values" (.lit (UInt64.ofNat index)) capacity 0),
+        .returnU64 (.indexGet root "values" (.lit (UInt64.ofNat index)) capacity 8)
+      ]
+  | _ => throw "extract/unsupported: bounded result requires static scalar or tagged Option elements"
+
+/-- Expand a top-level bounded result into its fixed scalar frame before either target chooses an
+output wire format. This is source projection only: Borsh/ABI length and padding remain target
+owned. v1 (`svm-rt-005`) admits wide scalars and one-level static tuple/record elements; dynamic
+children inside elements stay fail closed. -/
+private def expandBoundedReturnOps (schema : Core.Codec.Schema) (ops : Array Ops.Op) :
+    Except String (Array Ops.Op) :=
+  match ops.toList, schema with
+  | [.returnU64 root], .boundedArray capacity element
+  | [.returnState root], .boundedArray capacity element => do
+      let _ ← staticReturnLimbCount element
+      let mut result : Array Ops.Op := #[.returnU64 (.field root "length")]
+      for i in [0:capacity] do
+        result := result ++ (← expandStaticElementReturns root capacity i element)
+      pure result
+  | [.returnU64 root], .boundedBytes capacity | [.returnU64 root], .boundedString capacity
+  | [.returnState root], .boundedBytes capacity | [.returnState root], .boundedString capacity => do
+      let mut result : Array Ops.Op := #[.returnU64 (.field root "length")]
+      for i in [0:capacity] do
+        result := result.push (.returnU64 (.indexGet root "values" (.lit (UInt64.ofNat i)) capacity 0))
+      pure result
+  | leaves, .boundedArray capacity element => do
+      let limbs ← staticReturnLimbCount element
+      unless leaves.length == 1 + capacity * limbs do
+        throw "extract/unsupported: constructed bounded result has the wrong fixed-frame size"
+      leaves.toArray.mapM fun
+        | .returnU64 value | .returnState value => pure (.returnU64 value)
+        | _ => throw "extract/unsupported: constructed bounded result must contain scalar leaves"
+  | leaves, .boundedBytes capacity | leaves, .boundedString capacity => do
+      unless leaves.length == capacity + 1 do
+        throw "extract/unsupported: constructed bounded result has the wrong fixed-frame size"
+      leaves.toArray.mapM fun
+        | .returnU64 value | .returnState value => pure (.returnU64 value)
+        | _ => throw "extract/unsupported: constructed bounded result must contain scalar leaves"
+  | _, _ => pure ops
+
+/-- Count the fixed UInt64 payload lanes in the source representation of one enum constructor.
+The shared frame deliberately follows the representation Extract already uses for tagged inputs;
+Borsh and ABI tag widths, active-lane rules, and wire encoding remain target-owned. -/
+private def enumReturnPayloadWords : Core.Codec.Schema → Except String Nat
+  | .unit => pure 0
+  | .scalar (.uint 64) => pure 1
+  | .tuple items => do
+      for item in items do
+        unless item == .scalar .uint64 do
+          throw "extract/unsupported: tagged enum result fields must be UInt64"
+      pure items.size
+  | _ => throw "extract/unsupported: tagged enum result fields must be UInt64"
+
+/-- Verify that control-owning construction preserved an exact logical result frame on every
+successful path. Error exits are intentionally frame-free; nearby locals are never inferred as
+missing leaves. -/
+private def validateConstructedReturnFrame (ops : Array Ops.Op) (expected : Nat) :
+    Except String Unit := do
+  let graph ← IR.toCFG ops
+  let mut sawSuccess := false
+  for block in graph.blocks do
+    match block.terminator with
+    | .exit (.returnU64 _) =>
+        sawSuccess := true
+        unless expected == 1 do
+          throw s!"extract/unsupported: constructed result block {block.id} returns 1 of {expected} leaves"
+    | .exit (.returnU64s values) =>
+        sawSuccess := true
+        unless values.size == expected do
+          throw s!"extract/unsupported: constructed result returns {values.size} of {expected} leaves"
+    | .exit (.returnState _) | .exit (.okState _) | .exit (.initialize _) =>
+        throw "extract/unsupported: constructed result lost its explicit fixed frame"
+    | _ => pure ()
+  unless sawSuccess do
+    throw "extract/unsupported: constructed result has no successful fixed frame"
+
+/-- Project a top-level tagged result into a fixed source frame before either target selects its
+wire policy. Option uses `slot_tag, slot_p0`; enums use `variant_tag, variant_p0, ...`, matching the
+existing input-side source names without importing Borsh or ABI geometry into shared extraction. -/
+private def expandTaggedReturnOps (schema : Core.Codec.Schema) (ops : Array Ops.Op) :
+    Except String (Array Ops.Op) := do
+  let root? := match ops.toList with
+    | [.returnU64 root] | [.returnState root] => some root
+    | _ => none
+  match schema, root? with
+  | .option (.scalar type), some root => do
+      unless Core.Codec.Scalar.isWellFormed type do
+        throw "extract/unsupported: tagged Option result has malformed scalar payload"
+      let width := Core.Codec.Scalar.byteWidth type
+      unless 0 < width && width ≤ 32 do
+        throw "extract/unsupported: tagged Option result scalar exceeds 32-byte limb budget"
+      let parts := (width + 7) / 8
+      let mut result : Array Ops.Op := #[.returnU64 (.field root "slot_tag")]
+      -- Payload projections are rooted at `slot_p0` (see EntryAdapter.borshPlanAt); wide
+      -- scalars expose limbs as `slot_p0` / `slot_p0_w1` / ... rather than `slot_p1`.
+      if parts == 1 then
+        result := result.push (.returnU64 (.field root "slot_p0"))
+      else
+        for part in [0:parts] do
+          result := result.push (.returnU64 (.field root s!"slot_p0_w{part}"))
+      pure result
+  | .option payload, some root => do
+      let parts ← staticReturnLimbCount payload
+      let mut result : Array Ops.Op := #[.returnU64 (.field root "slot_tag")]
+      if parts == 1 then
+        result := result.push (.returnU64 (.field root "slot_p0"))
+      else
+        for part in [0:parts] do
+          result := result.push (.returnU64 (.field root s!"slot_p0_w{part}"))
+      pure result
+  | .option (.scalar type), none => do
+      unless Core.Codec.Scalar.isWellFormed type do
+        throw "extract/unsupported: tagged Option result has malformed scalar payload"
+      let width := Core.Codec.Scalar.byteWidth type
+      unless 0 < width && width ≤ 32 do
+        throw "extract/unsupported: tagged Option result scalar exceeds 32-byte limb budget"
+      let parts := (width + 7) / 8
+      validateConstructedReturnFrame ops (1 + parts)
+      pure ops
+  | .option payload, none => do
+      let parts ← staticReturnLimbCount payload
+      validateConstructedReturnFrame ops (1 + parts)
+      pure ops
+  | .enumeration _ tagBits variants, some root => do
+      unless tagBits == 8 && !variants.isEmpty && variants.size ≤ 256 do
+        throw "extract/unsupported: tagged enum result requires a nonempty u8 tag space"
+      let counts ← variants.mapM fun variant => enumReturnPayloadWords variant.2
+      let payloadWords := counts.foldl (init := 0) max
+      let mut result : Array Ops.Op := #[.returnU64 (.field root "variant_tag")]
+      for i in [0:payloadWords] do
+        result := result.push (.returnU64 (.field root ("variant_p" ++ toString i)))
+      pure result
+  | .enumeration .., none =>
+      throw "extract/unsupported: constructed tagged results are not yet represented as a fixed source frame"
+  | _, _ => pure ops
+
+/-- Project a compiler-owned static record result into the same fixed scalar frame already used
+for ordinary source records and wide scalars. The shared layer owns only logical field paths and
+little fixed limbs; Borsh/ABI widths, offsets, padding, and publication remain target-owned. -/
+private def expandStaticRecordReturnOps (schema : Core.Codec.Schema) (ops : Array Ops.Op) :
+    Except String (Array Ops.Op) := do
+  let .record _ _ := schema | return ops
+  let root? := match ops.toList with
+    | [.returnU64 root] | [.returnState root] => some root
+    | _ => none
+  let some root := root? | return ops
+  let leaves ← Core.Codec.staticLeaves schema
+  let mut result : Array Ops.Op := #[]
+  for leaf in leaves do
+    let width := leaf.type.byteWidth
+    unless leaf.type.isWellFormed && 0 < width && width ≤ 32 do
+      throw "extract/unsupported: static record return has malformed scalar leaf"
+    let parts := (width + 7) / 8
+    let name := leaf.sourceName
+    if parts == 1 then
+      result := result.push (.returnU64 (.field root name))
+    else
+      for part in [0:parts] do
+        result := result.push (.returnU64 (.field root s!"{name}_w{part}"))
+  return result
+
+private def markMethodArgs (kind : Core.IR.MethodKind) (count : Nat) (body : Expr) : Expr :=
+  let marker (index : Nat) := mkApp (mkConst ``methodArgRef) (mkNatLit index)
+  let abiIndex (dbIndex : Nat) : Nat :=
+    match kind with
+    | .init => count - 1 - dbIndex
+    | .increment | .get =>
+      if dbIndex + 1 == count then count - 1 else count - 2 - dbIndex
+  let rec go (depth : Nat) (e : Expr) : Expr :=
+    match e with
+    | .bvar index =>
+      if depth ≤ index && index - depth < count then marker (abiIndex (index - depth)) else e
+    | .app fn arg => .app (go depth fn) (go depth arg)
+    | .lam name type body info => .lam name (go depth type) (go (depth + 1) body) info
+    | .forallE name type body info => .forallE name (go depth type) (go (depth + 1) body) info
+    | .letE name type value body nondep =>
+      .letE name (go depth type) (go depth value) (go (depth + 1) body) nondep
+    | .mdata data body => .mdata data (go depth body)
+    | .proj type index value => .proj type index (go depth value)
+    | e => e
+  go 0 body
+
+def extractMethod (env : Environment) (kind : Core.IR.MethodKind) (n : Name) :
+    Except String IR.Method := do
+  let some info := env.find? n
+    | throw s!"extract/unsupported: unknown {n}"
+  let some e := info.value?
+    | throw s!"extract/unsupported: no value {n}"
+  let sketch := sketchOfExpr e
+  let stateType? :=
+    match kind, strip e with
+    | .init, _ => none
+    | _, .lam _ type _ _ => type.consumeMData.getAppFn.constName?
+    | _, _ => none
+  let (nLams, sourceBody) := peelLams e
+  let sourceBody := markMethodArgs kind nLams sourceBody
+  let ops0 ←
+    match kind with
+    | .increment => decodeMutating env sourceBody stateType?
+    | _ => decodeBody env sourceBody (stateType? := stateType?)
+  let lean := Core.IR.lastName n.toString
+  -- Inline entry helpers can own the source loop, so the entry body itself need not expose
+  -- `ForIn.forIn`. Explicit stores in the decoded loop distinguish state-carrying loops from
+  -- accumulator/early-return loops and are the authoritative post-inline signal.
+  let rec hasStateLoop (fuel : Nat) (ops : Array Ops.Op) : Bool :=
+    match fuel with
+    | 0 => false
+    | fuel' + 1 =>
+      ops.any fun
+        | .forBody _ body =>
+            Ops.hasStoreField body || Ops.hasIndexSet body || hasStateLoop fuel' body
+        | .ite _ _ _ thn els => hasStateLoop fuel' thn || hasStateLoop fuel' els
+        | _ => false
+  let stateLoop := hasStateLoop 16 ops0
+  let rec capturedStateArg (fuel : Nat) (v : Ops.Val) : Nat :=
+    match fuel with
+    | 0 => 0
+    | fuel' + 1 =>
+      let max2 l r := max (capturedStateArg fuel' l) (capturedStateArg fuel' r)
+      match v with
+      | .field (.arg i) _ => i
+      | .field base _ | .bitNot base => capturedStateArg fuel' base
+      | .indexGet base _ index _ _ => max2 base index
+      | .bitAnd l r | .bitOr l r | .bitXor l r | .shiftL l r | .shiftR l r
+      | .addU64 l r | .subU64 l r | .mulU64 l r | .divU64 l r | .modU64 l r =>
+        max2 l r
+      | .select _ l r t f => max (max2 l r) (max2 t f)
+      | _ => 0
+  let normalizeStateLoopVal (fuel : Nat) (v : Ops.Val) : Ops.Val :=
+    let expectedStateArg := nLams + 1
+    let captured := capturedStateArg fuel v
+    let binderShift := if captured > expectedStateArg then captured - expectedStateArg else 0
+    let rec go (fuel : Nat) (v : Ops.Val) : Ops.Val :=
+      match fuel with
+      | 0 => v
+      | fuel' + 1 =>
+        let state := .arg (nLams - 1)
+        match v with
+        -- Loop body binders are accumulator 0 and index 1. A dependent branch can insert
+        -- additional proof binders; a captured source-state projection witnesses that shift.
+        | .arg i =>
+            let i := if i ≥ binderShift then i - binderShift else i
+            if i ≥ 2 then .arg (i - 2) else .arg i
+        | .field _ name => .field state name
+        | .indexGet _ name index len off => .indexGet state name (go fuel' index) len off
+        | .bitAnd l r => .bitAnd (go fuel' l) (go fuel' r)
+        | .bitOr l r => .bitOr (go fuel' l) (go fuel' r)
+        | .bitXor l r => .bitXor (go fuel' l) (go fuel' r)
+        | .bitNot x => .bitNot (go fuel' x)
+        | .shiftL l r => .shiftL (go fuel' l) (go fuel' r)
+        | .shiftR l r => .shiftR (go fuel' l) (go fuel' r)
+        | .select c l r t f => .select c (go fuel' l) (go fuel' r) (go fuel' t) (go fuel' f)
+        | .addU64 l r => .addU64 (go fuel' l) (go fuel' r)
+        | .subU64 l r => .subU64 (go fuel' l) (go fuel' r)
+        | .mulU64 l r => .mulU64 (go fuel' l) (go fuel' r)
+        | .divU64 l r => .divU64 (go fuel' l) (go fuel' r)
+        | .modU64 l r => .modU64 (go fuel' l) (go fuel' r)
+        | v => v
+    go fuel v
+  let rec normalizeStateLoopOp (fuel : Nat) (op : Ops.Op) : Ops.Op :=
+    match fuel with
+    | 0 => op
+    | fuel' + 1 =>
+      let nv := normalizeStateLoopVal fuel'
+      match op with
+      | .letLocal i v => .letLocal i (nv v)
+      | .joinLocal i => .joinLocal i
+      | .setLocal i v => .setLocal i (nv v)
+      | .checkedAddU64 l r => .checkedAddU64 (nv l) (nv r)
+      | .checkedSubU64 l r => .checkedSubU64 (nv l) (nv r)
+      | .checkedMulU64 l r => .checkedMulU64 (nv l) (nv r)
+      | .checkedDivU64 l r => .checkedDivU64 (nv l) (nv r)
+      | .checkedModU64 l r => .checkedModU64 (nv l) (nv r)
+      | .ite cmp l r t f =>
+          .ite cmp (nv l) (nv r) (t.map (normalizeStateLoopOp fuel'))
+            (f.map (normalizeStateLoopOp fuel'))
+      | .forAccum bound addend resultLocal => .forAccum bound (nv addend) resultLocal
+      | .forBody bound body => .forBody bound (body.map (normalizeStateLoopOp fuel'))
+      | .indexSetLeaf name index value len leaf =>
+          .indexSetLeaf name (nv index) (nv value) len leaf
+      | .indexSet name index value len off => .indexSet name (nv index) (nv value) len off
+      | .storeField name value => .storeField name (nv value)
+      | .okState value => .okState (nv value)
+      | .returnU64 value => .returnU64 (nv value)
+      | .returnState value => .returnState (nv value)
+      | op => op
+  let ops0 := if stateLoop then ops0.map (normalizeStateLoopOp 32) else ops0
+  -- Resolve entry-parameter markers only after nested callback binders have been normalized.
+  let rec flipVal (fuel : Nat) (v : Ops.Val) : Ops.Val :=
+    match fuel with
+    | 0 => v
+    | fuel' + 1 =>
+      match v with
+      | .arg _ => v
+      | .local i =>
+        if methodArgLocalBase ≤ i then .arg (i - methodArgLocalBase) else v
+      | .field b n => .field (flipVal fuel' b) n
+      | .lit _ => v
+      | .bitAnd l r => .bitAnd (flipVal fuel' l) (flipVal fuel' r)
+      | .bitOr l r => .bitOr (flipVal fuel' l) (flipVal fuel' r)
+      | .bitXor l r => .bitXor (flipVal fuel' l) (flipVal fuel' r)
+      | .bitNot v => .bitNot (flipVal fuel' v)
+      | .shiftL l r => .shiftL (flipVal fuel' l) (flipVal fuel' r)
+      | .shiftR l r => .shiftR (flipVal fuel' l) (flipVal fuel' r)
+      | .indexGet b n i k off =>
+          .indexGet (flipVal fuel' b) n (flipVal fuel' i) k off
+      | .loopIx => v
+      | .select c l r t f =>
+          .select c (flipVal fuel' l) (flipVal fuel' r) (flipVal fuel' t) (flipVal fuel' f)
+      | .addU64 l r => .addU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .subU64 l r => .subU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .mulU64 l r => .mulU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .divU64 l r => .divU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .modU64 l r => .modU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .ext kind operands => .ext kind (operands.map (flipVal fuel'))
+  let rec flipOp (fuel : Nat) (op : Ops.Op) : Ops.Op :=
+    match fuel with
+    | 0 => op
+    | fuel' + 1 =>
+      match op with
+      | .letLocal i v => .letLocal i (flipVal fuel' v)
+      | .joinLocal i => .joinLocal i
+      | .setLocal i v => .setLocal i (flipVal fuel' v)
+      | .returnState v => .returnState (flipVal fuel' v)
+      | .returnU64 v => .returnU64 (flipVal fuel' v)
+      | .storeField n v => .storeField n (flipVal fuel' v)
+      | .okState v => .okState (flipVal fuel' v)
+      | .checkedAddU64 l r => .checkedAddU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .checkedSubU64 l r => .checkedSubU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .checkedMulU64 l r => .checkedMulU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .checkedDivU64 l r => .checkedDivU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .checkedModU64 l r => .checkedModU64 (flipVal fuel' l) (flipVal fuel' r)
+      | .ite c l r t f =>
+        .ite c (flipVal fuel' l) (flipVal fuel' r)
+          (t.map (flipOp fuel')) (f.map (flipOp fuel'))
+      | .forAccum n v resultLocal => .forAccum n (flipVal fuel' v) resultLocal
+      | .forBody n body => .forBody n (body.map (flipOp fuel'))
+      | .indexSetLeaf n i v k leaf =>
+          .indexSetLeaf n (flipVal fuel' i) (flipVal fuel' v) k leaf
+      | .indexSet n i v k off =>
+          .indexSet n (flipVal fuel' i) (flipVal fuel' v) k off
+      | .ext payload => nomatch payload
+      | .errorOverflow => .errorOverflow
+      | .errorNamed n => .errorNamed n
+      | .errorTyped frame => .errorTyped (frame.mapValues (flipVal fuel'))
+  let ops := ops0.map (flipOp 128)
+  let expandWide (ops : Array Ops.Op) (limbCount : Nat) : Array Ops.Op :=
+    match ops.toList with
+    | [.returnU64 (.ext kind operands)] =>
+      if limbCount == 1 then #[.returnU64 (.ext kind operands)]
+      else
+        let names := #["w0", "w1", "w2", "w3"].extract 0 limbCount
+        names.map fun n => .returnU64 (flattenField (.ext kind operands) n)
+    | [.returnU64 v] =>
+      let names := #["w0", "w1", "w2", "w3"].extract 0 limbCount
+      names.map fun n => .returnU64 (flattenField v n)
+    | _ => ops
+  let ops :=
+    let retTy := peelForalls info.type
+    match codecScalarOfType retTy with
+    | some (.uint bits) => if 64 < bits then expandWide ops ((bits + 63) / 64) else ops
+    | some (.fixedBytes bytes) => expandWide ops ((bytes + 7) / 8)
+    | some (.address 20) => expandWide ops 3
+    | _ => ops
+  let paramCount :=
+    match kind with
+    | .init => nLams
+    | .increment | .get => if nLams ≤ 1 then 0 else nLams - 1
+  let retTy := peelForalls info.type
+  let paramSchemas ← inferParamSchemas env e kind
+  unless paramSchemas.size == paramCount do
+    throw "extract/unsupported: boundary parameter schema count mismatch"
+  let paramTypes := scalarTypesOfSchemas paramSchemas
+  let paramWidths := paramTypes.map legacyWidthOfScalar
+  let retSchema ← logicalReturnSchema env kind retTy
+  let ops ← expandBoundedReturnOps retSchema ops
+  let ops ← expandTaggedReturnOps retSchema ops
+  let ops ← expandStaticRecordReturnOps retSchema ops
+  let retWidths :=
+    match kind with
+    | .get =>
+      if isUInt128Type retTy then #[16]
+      else if isUInt256Type retTy then #[32]
+      else if let some bytes := fixedBytesSize? retTy then #[bytes]
+      else if widthOfType retTy == some 1 then #[1]
+      else if widthOfType retTy == some 2 then #[2]
+      else if widthOfType retTy == some 4 then #[4]
+      else #[]
+    | _ => #[]
+  let rec maxReturnCount (fuel : Nat) (ops : Array Ops.Op) : Nat :=
+    match fuel with
+    | 0 => 0
+    | fuel' + 1 =>
+      let direct := ops.foldl (init := 0) fun count op =>
+        match op with | .returnU64 _ => count + 1 | _ => count
+      let nested := ops.foldl (init := 0) fun count op =>
+        match op with
+        | .ite _ _ _ thn els => max count (max (maxReturnCount fuel' thn) (maxReturnCount fuel' els))
+        | .forBody _ body => max count (maxReturnCount fuel' body)
+        | _ => count
+      max direct nested
+  let retCount :=
+    match kind with
+    | .get =>
+      if isUInt128Type retTy then 2
+      else if isUInt256Type retTy then 4
+      else if let some bytes := fixedBytesSize? retTy then (bytes + 7) / 8
+      else
+        let nRet := ops.foldl (init := 0) fun acc op =>
+          match op with | .returnU64 _ => acc + 1 | _ => acc
+        let nRet := max nRet (maxReturnCount 32 ops)
+        if nRet = 0 then 1 else nRet
+    | .increment =>
+      if retSchema == .unit then 0
+      else
+        let nRet := maxReturnCount 32 ops
+        let nRet := if nRet = 0 then 1 else nRet
+        match retSchema with
+        | .scalar s =>
+            if s == Core.Codec.Scalar.uint128 then max nRet 2
+            else if s == Core.Codec.Scalar.uint256 then max nRet 4
+            else nRet
+        | _ => nRet
+    | .init => 1
+  let retTypes :=
+    match retSchema with
+    | .scalar type => #[type]
+    | _ => #[]
+  let annotations : Array String := #[]
+  return {
+    kind, name := n.toString, ixName := Core.IR.ixNameOfLean lean
+    paramCount, paramWidths, paramTypes, paramSchemas, retWidths, retTypes, retSchema, retCount,
+    annotations, sketch, ops
+  }
+
+private def isUInt64Type (e : Expr) : Bool :=
+  e.consumeMData.getAppFn.constName? == some ``UInt64
+
+private structure SchemaFragment where
+  leaves : Array Core.Leaf := #[]
+  vectors : Array Core.VectorLayout := #[]
+
+private def SchemaFragment.byteWidth (fragment : SchemaFragment) : Nat :=
+  fragment.leaves.foldl (init := 0) fun width leaf => width + leaf.width
+
+private def scalarFragment (name : String) (place : Core.Place)
+    (ty : Core.ScalarTy) : SchemaFragment :=
+  { leaves := #[{ place, name, ty }] }
+
+private def optionFragment (name : String) (place : Core.Place) : SchemaFragment :=
+  { leaves := #[
+      { place := place.push .optionTag, name := s!"{name}_tag", ty := .optionTag },
+      { place := place.push .optionPayload, name := s!"{name}_p0", ty := .uint 64 }
+    ] }
+
+private def variantFragment (typeName name : String) (place : Core.Place)
+    (payloadWidth : Nat) : SchemaFragment := Id.run do
+  let mut leaves : Array Core.Leaf :=
+    #[{ place := place.push .variantTag, name := s!"{name}_tag", ty := .variantTag typeName }]
+  for index in [:payloadWidth] do
+    leaves := leaves.push {
+      place := place.push (.variantPayload index)
+      name := s!"{name}_p{index}"
+      ty := .uint 64
+    }
+  return { leaves }
+
+private def leafSchema (env : Environment) (fuel : Nat) (name : String)
+    (place : Core.Place) (ty : Expr) : Except String SchemaFragment :=
+  match fuel with
+  | 0 => .error s!"extract/unsupported: field {name} nest depth"
+  | fuel' + 1 =>
+    let ty := ty.consumeMData
+    if ty.getAppFn.constName? == some ``UInt64 then
+      .ok (scalarFragment name place (.uint 64))
+    else if ty.getAppFn.constName? == some ``UInt32 then
+      .ok (scalarFragment name place (.uint 32))
+    else if ty.getAppFn.constName? == some ``UInt16 then
+      .ok (scalarFragment name place (.uint 16))
+    else if ty.getAppFn.constName? == some ``UInt8 then
+      .ok (scalarFragment name place (.uint 8))
+    else if isUInt256Type ty then
+      .ok {
+        leaves := #[
+          { place := place.push (.field "UInt256" 0 "w0"), name := s!"{name}_w0", ty := .uint 64 },
+          { place := place.push (.field "UInt256" 1 "w1"), name := s!"{name}_w1", ty := .uint 64 },
+          { place := place.push (.field "UInt256" 2 "w2"), name := s!"{name}_w2", ty := .uint 64 },
+          { place := place.push (.field "UInt256" 3 "w3"), name := s!"{name}_w3", ty := .uint 64 }
+        ]
+      }
+    else if ty.getAppFn.constName? == some ``Option then
+      let args := ty.getAppArgs
+      if args.size ≥ 1 && args[args.size - 1]!.consumeMData.getAppFn.constName? == some ``UInt64 then
+        .ok (optionFragment name place)
+      else
+        .error s!"extract/unsupported: field {name} is not Option UInt64"
+    else if ty.getAppFn.constName? == some ``Vector then
+      let args := ty.getAppArgs
+      if args.size ≥ 2 then
+        match asLit 8 args[args.size - 1]! with
+        | some (.lit n) =>
+          if n.toNat = 0 then
+            .error s!"extract/unsupported: field {name} Vector length 0"
+          else
+            Id.run do
+              let mut leaves : Array Core.Leaf := #[]
+              let mut vectors : Array Core.VectorLayout := #[]
+              let mut elementBytes : Nat := 0
+              let mut elementLeaves : Nat := 0
+              for i in List.range n.toNat do
+                let itemPlace := place.push (.index i)
+                match leafSchema env fuel' s!"{name}_{i}" itemPlace args[args.size - 2]! with
+                | .error reason => return .error reason
+                | .ok item =>
+                    if i == 0 then
+                      elementBytes := item.byteWidth
+                      elementLeaves := item.leaves.size
+                    leaves := leaves ++ item.leaves
+                    vectors := vectors ++ item.vectors
+              let vector : Core.VectorLayout := {
+                place, name, length := n.toNat, elementBytes, elementLeaves
+              }
+              return .ok { leaves, vectors := #[vector] ++ vectors }
+        | _ => .error s!"extract/unsupported: field {name} Vector length is not a literal"
+      else
+        .error s!"extract/unsupported: field {name} is not Vector UInt64 n"
+    else if ty.getAppFn.constName? == some ``Array then
+      .error s!"extract/unsupported: field {name} Array is not fixed-length; use Vector"
+    else if ty.getAppFn.constName? == some ``Bool then
+      .ok (scalarFragment name place .bool)
+    else if let some tyName := ty.getAppFn.constName? then
+      if isEnumLeaf env tyName then
+        .ok (scalarFragment name place (.enum tyName.toString))
+      else if isUInt64Newtype env tyName then
+        .ok (scalarFragment name place (.newtype tyName.toString 64))
+      else if isOptionLikeInductive env tyName then
+        .ok (optionFragment name place)
+      else if let some payloadWidth := uint64VariantPayloadWidth? env tyName then
+        .ok (variantFragment tyName.toString name place payloadWidth)
+      else if isUserName env tyName && isStructure env tyName &&
+          !(isEnumLeaf env tyName) && !(isOptionLikeInductive env tyName) then
+        if !(getStructureParentInfo env tyName).isEmpty then
+          .error s!"extract/unsupported: field {name} record inheritance"
+        else
+          let fields := getStructureFields env tyName
+          if fields.isEmpty then
+            .error s!"extract/unsupported: field {name} record has no fields"
+          else
+            Id.run do
+              let mut acc : SchemaFragment := {}
+              let mut ordinal : Nat := 0
+              for f in fields do
+                if (isSubobjectField? env tyName f).isSome then
+                  return .error s!"extract/unsupported: field {name} record inheritance"
+                let some fty := fieldTypeExpr env tyName f
+                  | return .error s!"extract/unsupported: field {name}.{f} has no type"
+                let childPlace := place.push (.field tyName.toString ordinal f.toString)
+                match leafSchema env fuel' s!"{name}_{f}" childPlace fty with
+                | .error r => return .error r
+                | .ok fragment =>
+                    acc := {
+                      leaves := acc.leaves ++ fragment.leaves
+                      vectors := acc.vectors ++ fragment.vectors
+                    }
+                ordinal := ordinal + 1
+              return .ok acc
+      else if match env.find? tyName with | some (.inductInfo _) => true | _ => false then
+        .error s!"extract/unsupported: field {name} enum has payload"
+      else
+        .error s!"extract/unsupported: field {name} is not a supported leaf"
+    else
+      .error s!"extract/unsupported: field {name} is not a supported leaf"
+
+/-- `Examples.Counter.init` → `Counter`。 -/
+def programNameOfInit (n : Name) : String :=
+  match n with
+  | .str (.str _ mod) "init" => mod
+  | .str _ "init" => "Program"
+  | _ => "Program"
+
+/-- 从 `init` 返回类型收 typed state schema。无 `extends`。 -/
+def inferSchema (env : Environment) (initName : Name) : Except String Core.Schema := do
+  let some info := env.find? initName
+    | throw s!"extract/unsupported: unknown {initName}"
+  let some structName := (peelForalls info.type).getAppFn.constName?
+    | throw "extract/unsupported: init return is not a structure"
+  unless isStructure env structName do
+    throw s!"extract/unsupported: init return is not a structure {structName}"
+  unless (getStructureParentInfo env structName).isEmpty do
+    throw "extract/unsupported: record inheritance"
+  let names := getStructureFields env structName
+  if names.isEmpty then
+    throw "extract/unsupported: structure has no fields"
+  let mut leaves : Array Core.Leaf := #[]
+  let mut vectors : Array Core.VectorLayout := #[]
+  let mut ordinal : Nat := 0
+  for n in names do
+    if (isSubobjectField? env structName n).isSome then
+      throw "extract/unsupported: record inheritance"
+    let some ty := fieldTypeExpr env structName n
+      | throw s!"extract/unsupported: field {n} has no type"
+    let place : Core.Place := {
+      steps := #[.field structName.toString ordinal n.toString]
+    }
+    let fragment ← leafSchema env 8 n.toString place ty
+    leaves := leaves ++ fragment.leaves
+    vectors := vectors ++ fragment.vectors
+    ordinal := ordinal + 1
+  return { rootType := structName.toString, leaves, vectors }
+
+/-- Target-neutral physical slots are a derived view of the typed schema. -/
+def inferSlots (env : Environment) (initName : Name) : Except String (Array Core.IR.Slot) := do
+  return Core.IR.slotsOfSchema (← inferSchema env initName)
+
+def inferFields (env : Environment) (initName : Name) : Except String (Array String) := do
+  return (← inferSlots env initName).map (·.name)
+
+private structure FieldUse where
+  name : String
+  rootArg? : Option Nat := none
+
+private partial def valFields : Ops.Val → Array FieldUse
+  | .field (.arg i) n =>
+      if n == "w0" || n == "w1" || n == "w2" || n == "w3" then #[]
+      else #[{ name := n, rootArg? := some i }]
+  | .field (.local _) n =>
+      if n == "w0" || n == "w1" || n == "w2" || n == "w3" then #[] else #[{ name := n }]
+  | .field _ n => #[{ name := n }]
+  | .arg _ => #[]
+  | .local _ => #[]
+  | .lit _ => #[]
+  | .bitAnd l r | .bitOr l r | .bitXor l r | .shiftL l r | .shiftR l r =>
+      valFields l ++ valFields r
+  | .bitNot v => valFields v
+  | .indexGet b _ i _ => valFields b ++ valFields i
+  | .loopIx => #[]
+  | .select _ l r t f => valFields l ++ valFields r ++ valFields t ++ valFields f
+  | .addU64 l r | .subU64 l r | .mulU64 l r | .divU64 l r | .modU64 l r =>
+      valFields l ++ valFields r
+  | v => if Ops.hasPsyLeaf #[.returnU64 v] then #[] else #[]
+
+private def opFields : Ops.Op → Array FieldUse
+  | .letLocal _ v => valFields v
+  | .joinLocal _ => #[]
+  | .setLocal _ v => valFields v
+  | .checkedAddU64 l r => valFields l ++ valFields r
+  | .checkedSubU64 l r => valFields l ++ valFields r
+  | .checkedMulU64 l r => valFields l ++ valFields r
+  | .checkedDivU64 l r => valFields l ++ valFields r
+  | .checkedModU64 l r => valFields l ++ valFields r
+  | .ite _ l r t f =>
+      valFields l ++ valFields r ++ t.flatMap opFields ++ f.flatMap opFields
+  | .forAccum _ v _ => valFields v
+  | .forBody _ body => body.flatMap opFields
+  | .indexSetLeaf _ i v _ _ | .indexSet _ i v _ _ => valFields i ++ valFields v
+  | .ext payload => nomatch payload
+  | .storeField n v => #[{ name := n }] ++ valFields v
+  | .okState v => valFields v
+  | .errorOverflow => #[]
+  | .errorNamed _ => #[]
+  | .errorTyped frame => frame.values.flatMap valFields
+  | .returnU64 v => valFields v
+  | .returnState v => valFields v
+
+private def vectorLeafOffset? (schema : Core.Schema) (name leaf : String) : Option Nat :=
+  match schema.vector? name with
+  | none => none
+  | some vector => Id.run do
+      let mut offset := 0
+      for item in schema.vectorElementLeaves vector do
+        if vector.relativeLeafName item == leaf then return some offset
+        offset := offset + item.width
+      return none
+
+/-- Resolve logical dynamic-vector leaves exactly once, against the typed source schema. -/
+private def resolveVectorLeaves (p : IR.Program) : Except String IR.Program := do
+  let resolve (name leaf : String) : Except String Nat :=
+    match vectorLeafOffset? p.schema name leaf with
+    | some offset => pure offset
+    | none => throw s!"extract/unsupported: vector {name} has no leaf {leaf}"
+  let rec goVal (fuel : Nat) (v : Ops.Val) : Except String Ops.Val :=
+    match fuel with
+    | 0 => throw "extract/unsupported: value nesting exceeds schema resolution limit"
+    | fuel' + 1 =>
+      match v with
+      | .arg _ | .local _ | .lit _ | .loopIx => pure v
+      | .field (.indexGet b n i k _) leaf =>
+          return .indexGet (← goVal fuel' b) n (← goVal fuel' i) k (← resolve n leaf)
+      | .field b n => return .field (← goVal fuel' b) n
+      | .bitAnd l r => return .bitAnd (← goVal fuel' l) (← goVal fuel' r)
+      | .bitOr l r => return .bitOr (← goVal fuel' l) (← goVal fuel' r)
+      | .bitXor l r => return .bitXor (← goVal fuel' l) (← goVal fuel' r)
+      | .bitNot value => return .bitNot (← goVal fuel' value)
+      | .shiftL l r => return .shiftL (← goVal fuel' l) (← goVal fuel' r)
+      | .shiftR l r => return .shiftR (← goVal fuel' l) (← goVal fuel' r)
+      | .indexGet b n i k off =>
+          return .indexGet (← goVal fuel' b) n (← goVal fuel' i) k off
+      | .select c l r t f =>
+          return .select c (← goVal fuel' l) (← goVal fuel' r)
+            (← goVal fuel' t) (← goVal fuel' f)
+      | .addU64 l r => return .addU64 (← goVal fuel' l) (← goVal fuel' r)
+      | .subU64 l r => return .subU64 (← goVal fuel' l) (← goVal fuel' r)
+      | .mulU64 l r => return .mulU64 (← goVal fuel' l) (← goVal fuel' r)
+      | .divU64 l r => return .divU64 (← goVal fuel' l) (← goVal fuel' r)
+      | .modU64 l r => return .modU64 (← goVal fuel' l) (← goVal fuel' r)
+      | .ext kind operands => return .ext kind (← operands.mapM (goVal fuel'))
+  let normalizeVal := goVal 128
+  let rec goOp (fuel : Nat) (op : Ops.Op) : Except String Ops.Op :=
+    match fuel with
+    | 0 => throw "extract/unsupported: control-flow nesting exceeds schema resolution limit"
+    | fuel' + 1 =>
+      match op with
+      | .letLocal i v => return .letLocal i (← normalizeVal v)
+      | .joinLocal i => pure (.joinLocal i)
+      | .setLocal i v => return .setLocal i (← normalizeVal v)
+      | .checkedAddU64 l r => return .checkedAddU64 (← normalizeVal l) (← normalizeVal r)
+      | .checkedSubU64 l r => return .checkedSubU64 (← normalizeVal l) (← normalizeVal r)
+      | .checkedMulU64 l r => return .checkedMulU64 (← normalizeVal l) (← normalizeVal r)
+      | .checkedDivU64 l r => return .checkedDivU64 (← normalizeVal l) (← normalizeVal r)
+      | .checkedModU64 l r => return .checkedModU64 (← normalizeVal l) (← normalizeVal r)
+      | .indexSetLeaf n i v k leaf =>
+          return .indexSet n (← normalizeVal i) (← normalizeVal v) k (← resolve n leaf)
+      | .indexSet n i v k off =>
+          return .indexSet n (← normalizeVal i) (← normalizeVal v) k off
+      | .ite c l r t f =>
+          return .ite c (← normalizeVal l) (← normalizeVal r)
+            (← t.mapM (goOp fuel')) (← f.mapM (goOp fuel'))
+      | .forAccum n v resultLocal => return .forAccum n (← normalizeVal v) resultLocal
+      | .forBody n body => return .forBody n (← body.mapM (goOp fuel'))
+      | .storeField n v => return .storeField n (← normalizeVal v)
+      | .okState v => return .okState (← normalizeVal v)
+      | .errorOverflow => pure .errorOverflow
+      | .errorNamed n => pure (.errorNamed n)
+      | .errorTyped frame => return .errorTyped (← frame.mapValuesM normalizeVal)
+      | .returnU64 v => return .returnU64 (← normalizeVal v)
+      | .returnState v => return .returnState (← normalizeVal v)
+      | .ext payload => nomatch payload
+  return { p with methods := ← p.methods.mapM fun m => do
+    return { m with ops := ← m.ops.mapM (goOp 128) } }
+
+/-- Make state writeback explicit once, after source schema and normalized Ops are both available. -/
+private def evaluateProgram (p : IR.Program) : Except String IR.Program := do
+  let mut methods := #[]
+  for method in p.methods do
+    let evaluation ←
+      match Core.evaluate p.schema method.ops with
+      | .ok evaluation => pure evaluation
+      | .error reason => throw s!"{method.ixName}: {reason}"
+    methods := methods.push { method with evaluation }
+  return { p with methods }
+
+private def checkUsedFields (p : IR.Program) : Except String Unit := do
+  for m in p.methods do
+    for op in m.ops do
+      for field in opFields op do
+        if let some rootArg := field.rootArg? then
+          if rootArg < m.paramCount then continue
+        if (Core.IR.fieldWidth p field.name).isNone then
+          throw s!"{m.ixName}: extract/unsupported: unknown field {field.name}"
+
+/-- Typed initializers must account for every leaf; backends must never invent missing zeros. -/
+private def checkInitCoverage (p : IR.Program) : Except String Unit := do
+  for method in p.methods do
+    if method.kind == .init then
+      let count := method.ops.foldl (init := 0) fun total op =>
+        match op with | .returnState _ => total + 1 | _ => total
+      unless count == p.schema.leaves.size do
+        throw (s!"extract/unsupported: {method.ixName} initializes {count} state leaves, " ++
+          s!"schema requires {p.schema.leaves.size}")
+
+private partial def valEscapedArg (limit : Nat) : Ops.Val → Option Nat
+  | .arg i => if i < limit then none else some i
+  | .field b _ | .bitNot b => valEscapedArg limit b
+  | .bitAnd l r | .bitOr l r | .bitXor l r | .shiftL l r | .shiftR l r
+  | .addU64 l r | .subU64 l r | .mulU64 l r | .divU64 l r | .modU64 l r =>
+      #[l, r].findSome? (valEscapedArg limit)
+  | .indexGet b _ i _ => #[b, i].findSome? (valEscapedArg limit)
+  | .select _ l r t f => #[l, r, t, f].findSome? (valEscapedArg limit)
+  | _ => none
+
+private partial def opEscapedArg (limit : Nat) : Ops.Op → Option Nat
+  | .letLocal _ v => valEscapedArg limit v
+  | .joinLocal _ => none
+  | .setLocal _ v => valEscapedArg limit v
+  | .checkedAddU64 l r | .checkedSubU64 l r | .checkedMulU64 l r
+  | .checkedDivU64 l r | .checkedModU64 l r =>
+      #[l, r].findSome? (valEscapedArg limit)
+  | .ite _ l r t f =>
+      #[l, r].findSome? (valEscapedArg limit) <|>
+        t.findSome? (opEscapedArg limit) <|> f.findSome? (opEscapedArg limit)
+  | .forAccum _ v _ => valEscapedArg limit v
+  | .forBody _ body => body.findSome? (opEscapedArg limit)
+  | .indexSetLeaf _ i v _ _ | .indexSet _ i v _ _ =>
+      #[i, v].findSome? (valEscapedArg limit)
+  | .storeField _ v | .okState v | .returnU64 v | .returnState v => valEscapedArg limit v
+  | .errorOverflow | .errorNamed _ => none
+  | .errorTyped frame => frame.values.findSome? (valEscapedArg limit)
+
+/-- Reject decoder binder leaks before a backend can mistake one for calldata or state. -/
+private def checkArgBounds (p : IR.Program) : Except String Unit := do
+  for method in p.methods do
+    let limit := method.paramCount + if method.kind == .init then 0 else 1
+    for op in method.ops do
+      if let some i := opEscapedArg limit op then
+        (throw (s!"extract/unsupported: {method.ixName} escaped arg {i} " ++
+          s!"(paramCount {method.paramCount})") : Except String Unit)
+  return ()
+
+/-- Extract three named declarations directly into the extensible source dialect. -/
+def extractProgramIR (env : Environment)
+    (initName incrementName getName : Name)
+    (programName : Option String := none)
+    (fields? : Option (Array String) := none) :
+    Except String IR.Program := do
+  match Profile.checkAll env #[initName, incrementName, getName] with
+  | .reject reason => throw reason
+  | .accept => pure ()
+  let schema ← inferSchema env initName
+  let inferred := Core.IR.slotsOfSchema schema
+  let slots ←
+    match fields? with
+    | none => pure inferred
+    | some fs =>
+      if fs == inferred.map (·.name) then pure inferred
+      else throw s!"extract/unsupported: fields {fs} != inferred {inferred.map (·.name)}"
+  let initM ← extractMethod env .init initName
+  let incM ← extractMethod env .increment incrementName
+  let getM ← extractMethod env .get getName
+  let program : IR.Program := {
+    name := programName.getD (programNameOfInit initName)
+    slots
+    schema
+    methods := #[initM, incM, getM]
+  }
+  unless Core.IR.isProgramShape program do
+    throw "extract/unsupported: not three-method shape"
+  unless Core.IR.schemaMatchesSlots program do
+    throw "extract/unsupported: schema does not match slots"
+  checkInitCoverage program
+  let program ← resolveVectorLeaves program
+  checkArgBounds program
+  let program ← evaluateProgram program
+  checkUsedFields program
+  return program
+
+def extractCounterIR := extractProgramIR
+
+private def isExceptType (e : Expr) : Bool :=
+  e.consumeMData.getAppFn.constName? == some ``Except
+
+/-- `Except` → mutate；`UInt64` → view；其它用户 structure → init。
+`UInt64` 本身也是 structure，必须先判。 -/
+def inferKind (env : Environment) (n : Name) : Except String Core.IR.MethodKind := do
+  let some info := env.find? n
+    | throw s!"extract/unsupported: unknown {n}"
+  let ret := peelForalls info.type
+  if isExceptType ret then
+    return .increment
+  if isUInt64Type ret || (codecScalarOfType ret).isSome then
+    return .get
+  if ret.getAppFn.constName? == some ``Prod then
+    return .get
+  if ret.getAppFn.constName? == some boundedVecName ||
+      ret.getAppFn.constName? == some boundedBytesName ||
+      ret.getAppFn.constName? == some boundedStringName then
+    return .get
+  if let some typeName := ret.getAppFn.constName? then
+    if !isStructure env typeName &&
+        (match env.find? typeName with | some (.inductInfo _) => true | _ => false) then
+      return .get
+  if let some structName := ret.getAppFn.constName? then
+    if Attr.isBoundary env structName then
+      return .get
+    if isStructure env structName && structName != ``UInt64 &&
+        structName != ``Prod &&
+        structName != uint128Name && structName != uint256Name &&
+        structName != fixedBytesName then
+      return .init
+  throw s!"extract/unsupported: cannot classify {n}"
+
+private def sortNames (ns : Array Name) : Array Name :=
+  ns.qsort (·.toString < ·.toString)
+
+/-- 收同一名字空间下 `@[pf_entry]` 的根，直接生成 extensible IR。 -/
+def extractModuleIR (env : Environment) (ns : Name)
+    (fields? : Option (Array String) := none) :
+    Except String IR.Program := do
+  let tagged := sortNames (Attr.entriesIn env ns)
+  if tagged.isEmpty then
+    throw "extract/unsupported: no pf_entry"
+  let mut inits : Array Name := #[]
+  let mut muts : Array Name := #[]
+  let mut views : Array Name := #[]
+  for n in tagged do
+    match Profile.check env n with
+    | .reject reason => throw reason
+    | .accept => pure ()
+    match ← inferKind env n with
+    | .init => inits := inits.push n
+    | .increment => muts := muts.push n
+    | .get => views := views.push n
+  if inits.isEmpty then
+    throw "extract/unsupported: missing init method"
+  if muts.isEmpty then
+    throw "extract/unsupported: missing mutating method"
+  if views.isEmpty then
+    throw "extract/unsupported: missing view method"
+  let initName :=
+    match inits.find? (fun n => Core.IR.lastName n.toString == "init") with
+    | some n => n
+    | none => inits[0]!
+  let schema ← inferSchema env initName
+  let inferred := Core.IR.slotsOfSchema schema
+  let slots ←
+    match fields? with
+    | none => pure inferred
+    | some fs =>
+      if fs == inferred.map (·.name) then pure inferred
+      else throw s!"extract/unsupported: fields {fs} != inferred {inferred.map (·.name)}"
+  let mut methods : Array IR.Method := #[]
+  let mut seen : Array String := #[]
+  for n in inits do
+    let m ←
+      match extractMethod env .init n with
+      | .ok method => pure method
+      | .error reason => throw s!"{n}: {reason}"
+    if seen.contains m.ixName then
+      throw s!"extract/unsupported: duplicate ixName {m.ixName}"
+    seen := seen.push m.ixName
+    methods := methods.push m
+  for n in muts do
+    let m ←
+      match extractMethod env .increment n with
+      | .ok method => pure method
+      | .error reason => throw s!"{n}: {reason}"
+    if seen.contains m.ixName then
+      throw s!"extract/unsupported: duplicate ixName {m.ixName}"
+    seen := seen.push m.ixName
+    methods := methods.push m
+  for n in views do
+    let m ←
+      match extractMethod env .get n with
+      | .ok method => pure method
+      | .error reason => throw s!"{n}: {reason}"
+    if seen.contains m.ixName then
+      throw s!"extract/unsupported: duplicate ixName {m.ixName}"
+    seen := seen.push m.ixName
+    methods := methods.push m
+  let program : IR.Program := {
+    name := programNameOfInit initName
+    slots
+    schema
+    methods
+  }
+  unless Core.IR.isProgramShape program do
+    throw "extract/unsupported: not program shape"
+  unless Core.IR.schemaMatchesSlots program do
+    throw "extract/unsupported: schema does not match slots"
+  checkInitCoverage program
+  let program ← resolveVectorLeaves program
+  checkArgBounds program
+  let program ← evaluateProgram program
+  checkUsedFields program
+  return program
+
+end ProofForge.Extract
