@@ -40,7 +40,11 @@ def counterPackageGoldenV1 : Dpn.Schema.PackageV1 :=
 
 /-- Extract the in-tree Counter fixture through the product pipeline. -/
 unsafe def extractedCounterPlan : IO (Except String Plan.Plan) := do
+  -- Seed the search path from the environment LEAN_PATH first (lake env sets
+  -- it), then extend with the toolchain sysroot. Without this the exe in a
+  -- fresh checkout cannot find the Examples oleans.
   Lean.initSearchPath (← Lean.findSysroot)
+  Lean.searchPathRef.set (← Lean.addSearchPathFromEnv (← Lean.searchPathRef.get))
   Lean.enableInitializersExecution
   let env ← Lean.importModules #[{ module := `Examples.Psy.Counter }] {} (loadExts := true)
   return Extract.extractModuleIR env `Examples.Psy.Counter none >>= Emit.planOfExtracted

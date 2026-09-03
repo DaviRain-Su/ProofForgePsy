@@ -199,6 +199,7 @@ private unsafe def extractPsyPlans (units : Array BuildUnit) :
     IO (Except String (Array (String × String))) :=
   try
     Lean.initSearchPath (← Lean.findSysroot)
+    Lean.searchPathRef.set (← Lean.addSearchPathFromEnv (← Lean.searchPathRef.get))
     Lean.enableInitializersExecution
     let modules := units.map fun u => ({ module := u.module } : Lean.Import)
     let env ← Lean.importModules modules {} (loadExts := true)
