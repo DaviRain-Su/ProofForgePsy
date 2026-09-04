@@ -570,7 +570,7 @@ def lowerMethod (leafNames : Array String)
     unless !method.ops.isEmpty do
       return ← lowerError s!"{method.ixName}: init has no returnState"
     let mut out : Array Statement := #[]
-    let st : SeqState := {}
+    let mut st : SeqState := {}
     for op in method.ops do
       match op with
       | .returnState v =>
@@ -579,8 +579,10 @@ def lowerMethod (leafNames : Array String)
             return ← lowerError s!"{method.ixName}: init produces more leaves than the state schema"
           let e ← valToExpr ctx st.env v
           out := out.push (.store idx e)
-      | .letLocal .. =>
-          return ← lowerError s!"{method.ixName}: init locals are not admitted in psy-dpn-v1"
+      | .letLocal i v =>
+          -- init computations: bind the local, keep building stores.
+          let e ← valToExpr ctx st.env v
+          st := { st with env := st.env.filter (·.1 != i) |>.push (i, e) }
       | _ =>
           return ← lowerError s!"{method.ixName}: non-returnState op in init"
     unless out.size == leafNames.size do
