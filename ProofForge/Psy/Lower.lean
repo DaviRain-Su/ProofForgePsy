@@ -185,9 +185,20 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
       -- A projection off a local is unreachable for scalar locals; surface the binding.
       let _ ← envLookup env i
       lowerError s!"nested field projection off local {i} is not admitted"
-  | .field base _ => do
-      let _ ← valToExpr ctx env base
-      lowerError "nested field projection is not admitted in psy-dpn-v1"
+  | .field base inner => do
+      -- Flatten a boundary-struct projection: `.field (.field base "v")
+      -- "w0"` maps to leaf `v_w0` when that is a known state leaf.
+      match base with
+      | .field b outer =>
+          let flat := s!"{outer}_{inner}"
+          match ctx.leafIndexOf flat with
+          | some idx => pure (.stateLoad idx)
+          | none =>
+              let _ ← valToExpr ctx env base
+              lowerError s!"nested field projection {outer}.{inner} is not admitted"
+      | _ =>
+          let _ ← valToExpr ctx env base
+          lowerError "nested field projection is not admitted in psy-dpn-v1"
   | .local i => envLookup env i
   | .loopIx =>
       lowerError "loop variable reached the Psy boundary (state loops fail closed in psy-dpn-v1)"

@@ -24,14 +24,14 @@ def getW0 (s : State) : UInt64 :=
 def getW1 (s : State) : UInt64 :=
   s.v.w1
 
-/-- mutating: add UInt64 to w0. -/
+/-- mutating: no-op ok (state unchanged). -/
 @[pf_entry]
-def bump (s : State) (d : UInt64) : Except Error (State × UInt64) :=
-  if s.v.w0 ≤ ~~~(0 : UInt64) - d then
-    let nw0 := s.v.w0 + d
-    .ok ({ v := { w0 := nw0, w1 := s.v.w1 } }, nw0)
+def noop (s : State) : Except Error (State × UInt64) :=
+  if (0 : UInt64) ≠ 1 then
+    .ok (s, 0)
   else
     .error .overflow
 
 end Examples.Psy.WideProbe
+
 #pf_psy_dump Examples.Psy.WideProbe

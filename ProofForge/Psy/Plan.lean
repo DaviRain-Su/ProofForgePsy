@@ -22,6 +22,18 @@ Lean wrapping `+`/`-`/`*`/`/`/`%` on `UInt64` lower to the checked variants:
 on Psy there is no faithful wrapping interpretation, so we trap instead.
 -/
 
+/-- Which exact UInt128 div/mod result a target-owned restoring binding exposes. -/
+inductive WideUInt128DivModResultV1 where
+  | quotient
+  | remainder
+  deriving BEq, Inhabited, Repr
+
+/-- Direction of an exact UInt128 shift binding (count is UInt32 Felt). -/
+inductive WideUInt128ShiftKindV1 where
+  | shl
+  | shr
+  deriving BEq, Inhabited, Repr
+
 /-- Plan expression over Felt-carried UInt64/Bool scalars. -/
 inductive Expr where
   | literal (value : UInt64)
@@ -76,6 +88,15 @@ inductive Expr where
   /-- Felt-valued conditional used to materialize carry/borrow without field
       division. `condition` is Bool; both branches are Felt expressions. -/
   | select (condition thenValue elseValue : Expr)
+  /-- G5-WIDE: result limb `limbIndex` of a target-owned `bindWideUintMul`.
+      Must appear in the same lexical statement region as the binding. -/
+  | wideUintMulLimb (bitWidth operationId limbIndex : Nat)
+  /-- G5-WIDE: result limb `limbIndex` of a `bindWideUintDivMod`. -/
+  | wideUintDivModLimb (resultKind : WideUInt128DivModResultV1)
+      (bitWidth operationId limbIndex : Nat)
+  /-- G5-WIDE: result limb `limbIndex` of a `bindWideUintShift`. -/
+  | wideUintShiftLimb (kind : WideUInt128ShiftKindV1)
+      (bitWidth operationId limbIndex : Nat)
   deriving BEq, Inhabited, Repr
 
 inductive Statement where
@@ -97,7 +118,19 @@ inductive Statement where
   /-- Void synchronous external call (DPN-6 PARTIAL): hashed static
       qualified name, `numOutputs = 0`, no response binding. -/
   | externalCall (callee : Array String) (args : Array Expr)
+  /-- G5-WIDE: target-owned schoolbook mul binding. `lhs`/`rhs` are
+      `limbCount` UInt32 limbs; `operationId` scopes the `wideUintMulLimb`
+      result references. -/
+  | bindWideUintMul (bitWidth operationId : Nat) (lhs rhs : Array Expr)
+  /-- G5-WIDE: target-owned restoring div/mod binding (unrolled). -/
+  | bindWideUintDivMod (resultKind : WideUInt128DivModResultV1)
+      (bitWidth operationId : Nat) (lhs rhs : Array Expr)
+  /-- G5-WIDE: target-owned exact shift binding (fixed bit-width bit walk). -/
+  | bindWideUintShift (kind : WideUInt128ShiftKindV1)
+      (bitWidth operationId : Nat) (value : Array Expr) (count : Expr)
   deriving BEq, Inhabited, Repr
+
+
 
 inductive FunctionKind where
   | initialize
@@ -167,8 +200,6 @@ private partial def renderExpr : Expr → String
   | .ctxCallerContractId => "ctx callerContractId"
   | .ctxUserPublicKeyHash => "ctx userPublicKeyHash"
   | .ctxSessionProofTreeRoot => "ctx sessionProofTreeRoot"
-  -- Hash/IMT args render via `repr` (stable derived representation; the
-  -- digest only needs determinism, not the pretty form).
   | .hashNoPad args => s!"(hashNoPad {joinRepr args})"
   | .hashPad args => s!"(hashPad {joinRepr args})"
   | .hashTwoToOne args => s!"(hash2to1 {joinRepr args})"
@@ -180,6 +211,13 @@ private partial def renderExpr : Expr → String
   | .imtGetExternal c k => s!"(imtGetExt {repr c} {repr k})"
   | .imtGetOther u c k => s!"(imtGetOther {repr u} {repr c} {repr k})"
   | .imtContainsOther u c k => s!"(imtHasOther {repr u} {repr c} {repr k})"
+  | .wideUintMulLimb bw op li => s!"(wmul {bw} {op} {li})"
+  | .wideUintDivModLimb kind bw op li =>
+      let k := match kind with | .quotient => "q" | .remainder => "r"
+      s!"(wdiv {k} {bw} {op} {li})"
+  | .wideUintShiftLimb kind bw op li =>
+      let k := match kind with | .shl => "shl" | .shr => "shr"
+      s!"(wshl {k} {bw} {op} {li})"
 
 private partial def renderStmts (indent : String) (stmts : Array Statement) : String :=
   let openBrace : String := "{"
@@ -212,6 +250,14 @@ private partial def renderStmts (indent : String) (stmts : Array Statement) : St
         s!"{indent}emit {name}({joinRepr args}){nl}"
     | .externalCall callee args =>
         s!"{indent}call {renderCallee callee}({joinRepr args}){nl}"
+    | .bindWideUintMul bw op lhs rhs =>
+        s!"{indent}wbind mul {bw} {op} {joinRepr lhs} {joinRepr rhs}{nl}"
+    | .bindWideUintDivMod kind bw op lhs rhs =>
+        let k := match kind with | .quotient => "q" | .remainder => "r"
+        s!"{indent}wbind div {k} {bw} {op} {joinRepr lhs} {joinRepr rhs}{nl}"
+    | .bindWideUintShift kind bw op value count =>
+        let k := match kind with | .shl => "shl" | .shr => "shr"
+        s!"{indent}wbind {k} {bw} {op} {joinRepr value} {renderExpr count}{nl}"
   String.intercalate "" (stmts.map one).toList
 
 def renderCanonical (plan : Plan) : String :=

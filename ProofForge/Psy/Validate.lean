@@ -26,7 +26,9 @@ private def validateExprNodes (expr : Expr) : Option Nat :=
   match expr with
   | .literal _ | .boolLiteral _ | .param _ | .stateLoad _
   | .ctxUserId | .ctxContractId | .ctxCheckpointId | .ctxNonce
-  | .ctxCallerContractId | .ctxUserPublicKeyHash | .ctxSessionProofTreeRoot => some 1
+  | .ctxCallerContractId | .ctxUserPublicKeyHash | .ctxSessionProofTreeRoot
+  | .wideUintMulLimb _ _ _ | .wideUintDivModLimb _ _ _ _
+  | .wideUintShiftLimb _ _ _ _ => some 1
   | .checkedAdd l r | .checkedSub l r | .checkedMul l r | .checkedDiv l r
   | .checkedMod l r | .bitAnd l r | .bitOr l r | .bitXor l r
   | .shl l r | .shr l r => do
@@ -111,6 +113,15 @@ private partial def validateStatements (stmts : Array Statement) : Except String
         if callee.size < 2 then
           planError "external callee must have ≥2 qualified-name components"
         for a in args do validateExpr a
+    | .bindWideUintMul _ _ lhs rhs =>
+        for l in lhs do validateExpr l
+        for r in rhs do validateExpr r
+    | .bindWideUintDivMod _ _ _ lhs rhs =>
+        for l in lhs do validateExpr l
+        for r in rhs do validateExpr r
+    | .bindWideUintShift _ _ _ value count =>
+        for v in value do validateExpr v
+        validateExpr count
 
 /-- Does any statement in this sequence return a value (possibly under a branch)? -/
 private partial def returnsAnywhere (stmts : Array Statement) : Bool :=
