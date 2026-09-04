@@ -19,10 +19,14 @@
     a dead `returnValue (lit 0)` when the other arm returns, so return arity
     stays symmetric.
 
-  Fail-closed boundaries (psy-dpn-v1 slice): dynamic vector indices, state
-  loops (`forAccum`/`forBody`), typed error payloads, aggregate/multi-value
-  returns, aggregate (struct) parameters, whole-state scalar reads, wide
-  (UInt128/256) state slots.
+  Admitted (PSY-LOOP): bounded `forAccum`/`forBody` static unroll (≤64
+  steps) with the loop variable substituted to per-step literals, including
+  loop-var addends (`acc += i.toUInt64`).
+
+  Fail-closed boundaries (psy-dpn-v1 slice): dynamic vector indices, returns
+  inside loop bodies, typed error payloads (zero-arg named reverts are
+  tagged per PSY-TYPED-ERROR), aggregate (struct) parameters, whole-state
+  scalar reads, wide (UInt128/256) state slots, >64-step loops.
 -/
 import ProofForge.Extract.IR
 import ProofForge.Core.Target
