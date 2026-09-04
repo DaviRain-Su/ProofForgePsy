@@ -22,6 +22,9 @@ inductive ValKind where
   | cryptoHashPad
   | cryptoHashTwoToOne
   | cryptoKeccak256
+  /-- Full HashOut multi-limb ABI: operands = args ++ [limbIndex]. -/
+  | cryptoHashNoPadLimb
+  | cryptoHashTwoToOneLimb
   /-- IMT self-current pilot + external/other-user reads. `imtSet` carries
       key+value operands and returns the value (product ABI). -/
   | imtGet
@@ -41,9 +44,10 @@ def ValKind.arity : ValKind → Nat :=
     -- Hash/IMT leaves carry their arguments as operands. The value is the
     -- MAXIMUM admitted arity (the extractor flattens `Array UInt64`
     -- literals into individual operands; projection checks ≤).
-    | .cryptoHashNoPad | .cryptoHashPad => 8
-    | .cryptoHashTwoToOne => 8
+    | .cryptoHashNoPad | .cryptoHashPad => 9
+    | .cryptoHashTwoToOne => 9
     | .cryptoKeccak256 => 16
+    | .cryptoHashNoPadLimb | .cryptoHashTwoToOneLimb => 9
     | .imtGet | .imtContains | .imtSet => 2
     | .imtGetExternal => 2
     | .imtGetOther | .imtContainsOther => 3

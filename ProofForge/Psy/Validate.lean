@@ -51,6 +51,14 @@ private def validateExprNodes (expr : Expr) : Option Nat :=
         | some n, some d =>
             if n + d > maxExprDepth then none else some (n + d)
         | _, _ => none
+  | .hashOutLimb kind limbIndex args =>
+      if kind > 5 || limbIndex ≥ 4 then none
+      else
+        args.foldl (init := some 1) fun acc a =>
+          match acc, validateExprNodes a with
+          | some n, some d =>
+              if n + d > maxExprDepth then none else some (n + d)
+          | _, _ => none
   | .imtGet k | .imtContains k => do
       let d ← validateExprNodes k
       if d + 1 > maxExprDepth then none else some (d + 1)

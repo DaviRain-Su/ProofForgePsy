@@ -75,6 +75,17 @@ Official simulate injects no session root, so the product value is `0`. -/
 @[irreducible] def keccak256 (args : Array UInt64) : UInt64 :=
   args.foldl (init := 0) fun acc a => acc * 31 + a
 
+/-- Full HashOut product ABI: `pf.crypto.hashNoPadFull(args, limb)` — one
+limb (0..3) of the HashOut. Official simulate fills hash_out_arrays for
+hashNoPad/hashTwoToOne; Array4 return aggregates over 4 limb calls (HashOut
+CSE dedups to one circuit op). -/
+@[irreducible] def hashNoPadFull (args : Array UInt64) (limb : UInt64) : UInt64 :=
+  hashNoPad args
+
+/-- Full HashOut product ABI: hashTwoToOne limb (0..3). -/
+@[irreducible] def hashTwoToOneFull (args : Array UInt64) (limb : UInt64) : UInt64 :=
+  hashTwoToOne args
+
 /-- `pf.imt.get(key)`: self-contract current IMT value at `key`. -/
 @[irreducible] def imtGet (_key : UInt64) : UInt64 := _key
 

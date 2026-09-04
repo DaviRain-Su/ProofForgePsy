@@ -345,6 +345,12 @@ private partial def asValNamed (env : Environment) (fuel : Nat) (n : Name) (e : 
   else if isConstNamed e ``ProofForge.Psy.Runtime.keccak256 &&
       e.getAppArgs.size ≥ 1 then
     psyAppLeaf .cryptoKeccak256 env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.hashNoPadFull &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoHashNoPadLimb env fuel e
+  else if isConstNamed e ``ProofForge.Psy.Runtime.hashTwoToOneFull &&
+      e.getAppArgs.size ≥ 1 then
+    psyAppLeaf .cryptoHashTwoToOneLimb env fuel e
   else if isConstNamed e ``ProofForge.Psy.Runtime.imtGet &&
       e.getAppArgs.size ≥ 1 then
     psyAppLeaf .imtGet env fuel e

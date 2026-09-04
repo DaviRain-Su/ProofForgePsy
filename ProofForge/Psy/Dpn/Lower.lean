@@ -1053,6 +1053,33 @@ partial def lowerExprV1 (b : BuilderV1) (params : Array WireV1) :
       match limbs[0]? with
       | some w => pure (b2, w)
       | none => planError "hashTwoToOne limb0 missing"
+  | .hashOutLimb kind limbIndex args => do
+      unless kind ≤ 5 do
+        planError s!"hashOutLimb kind {kind} out of range"
+      unless limbIndex < 4 do
+        planError s!"hashOutLimb limbIndex {limbIndex} out of range"
+      let mut bCur := b
+      let mut ins : Array UInt64 := #[]
+      for a in args do
+        let (b1, w) ← lowerExprV1 bCur params a
+        let ti ← asTargetIndex w
+        bCur := b1
+        ins := ins.push (UInt64.ofNat ti)
+      let op : OpTypeV1 :=
+        match kind with
+        | 0 => .hashNoPad
+        | 1 => .hashPad
+        | 2 => .hashTwoToOne
+        | 3 => .keccak256
+        | 4 => .getUserPublicKeyHash
+        | _ => .getSessionProofTreeRoot
+      -- Context ops are valueless (inputs [0]); crypto uses lowered args.
+      let inputs :=
+        if kind ≥ 4 then (#[0] : Array UInt64) else ins
+      let (b2, limbs) := emitHashOutFull bCur kind op inputs
+      match limbs[limbIndex]? with
+      | some w => pure (b2, w)
+      | none => planError "hashOutLimb missing"
   | .keccak256 args => do
       -- keccak256: Target-typed first-word ABI (official stores U32TargetArray,
       -- not HashOut arrays — Array4 full ABI is not admitted for keccak).

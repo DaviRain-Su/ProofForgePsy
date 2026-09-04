@@ -229,6 +229,17 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         | .cryptoHashPad => .hashPad oe
         | .cryptoHashTwoToOne => .hashTwoToOne oe
         | .cryptoKeccak256 => .keccak256 oe
+        | .cryptoHashNoPadLimb =>
+            -- Last operand is the limb index literal; the rest are the args.
+            match oe.back? with
+            | some (.literal limb) =>
+                .hashOutLimb 0 limb.toNat (oe.extract 0 (oe.size - 1))
+            | _ => .hashOutLimb 0 0 (oe.extract 0 (oe.size - 1))
+        | .cryptoHashTwoToOneLimb =>
+            match oe.back? with
+            | some (.literal limb) =>
+                .hashOutLimb 2 limb.toNat (oe.extract 0 (oe.size - 1))
+            | _ => .hashOutLimb 2 0 (oe.extract 0 (oe.size - 1))
         | .imtGet => .imtGet (atIdx 0)
         | .imtContains => .imtContains (atIdx 0)
         | .imtSet => .imtSet (atIdx 0) (atIdx 1)

@@ -58,6 +58,12 @@ inductive Expr where
   | hashPad (args : Array Expr)
   | hashTwoToOne (args : Array Expr)
   | keccak256 (args : Array Expr)
+  /-- Full HashOut multi-limb product ABI: one limb (0..3) of a HashOut op.
+      `kind`: 0=hashNoPad, 1=hashPad, 2=hashTwoToOne, 3=keccak256,
+      4=userPublicKeyHash, 5=sessionProofTreeRoot. Full Array4 ABI is
+      admitted only for hashNoPad/hashTwoToOne (official simulate fills
+      hash_out_arrays); keccak/context stay limb0. -/
+  | hashOutLimb (kind limbIndex : Nat) (args : Array Expr)
   /-- IMT self-current pilot: UInt64 key/value packed as [scalar, 0, 0, 0]
       4-limb wire indices; base_offset = 0, capacity = 2^20. -/
   | imtGet (key : Expr)
@@ -167,6 +173,7 @@ private partial def renderExpr : Expr → String
   | .hashPad args => s!"(hashPad {joinRepr args})"
   | .hashTwoToOne args => s!"(hash2to1 {joinRepr args})"
   | .keccak256 args => s!"(keccak {joinRepr args})"
+  | .hashOutLimb kind i args => s!"(hashOut {kind} {i} {joinRepr args})"
   | .imtGet k => s!"(imtGet {repr k})"
   | .imtContains k => s!"(imtHas {repr k})"
   | .imtSet k v => s!"(imtSet {repr k} {repr v})"
