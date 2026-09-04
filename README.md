@@ -74,21 +74,31 @@ Admitted: single-leaf / multi-leaf `UInt64`/`Bool` scalar state, checked
 UInt64 arithmetic (add/sub/mul/div/mod), bitwise ops, compares, select,
 shl/shr, checked bitwise-not, DPN context reads (`psyUserId`, …),
 if/else with select-merged returns and stores, fixed vectors (static index),
-and G5-WIDE `UInt128`/`UInt256` state slots (multi-limb fields flatten to one
-`UInt64` leaf per 32-bit limb; checked wide mul/div/mod/shift lower through
-target-owned `bindWideUint*` bindings, exercised by hand-built Plans).
+multi-value aggregate returns (B-RET-AGG: 1..8 Felt leaves, including
+non-`UInt64` leaf shapes such as scalar+`Bool` pairs and `BoundedVec` length
++ N×Felt frames), narrow `UInt{8,16,32}` checked arithmetic under the
+explicit-overflow-guard pattern (`PlanParam.uintWidth` + `narrowChecked*`
+Expr constructors carry the width; DPN emission asserts `result < 2^w`,
+underflow, div-by-zero, and entry param range), and G5-WIDE
+`UInt128`/`UInt256` state slots (multi-limb fields flatten to one `UInt64`
+leaf per limb; checked wide mul/div/mod/shift lower through target-owned
+`bindWideUint*` bindings).
 
 Fail-closed (rejected at lowering): dynamic vector indices, state loops,
-typed error payloads, aggregate/multi-value returns, aggregate parameters,
-and source-level UInt128/256 arithmetic that reads a sibling limb inside a
-mutating update (e.g. `{ v := { w0 := s.v.w0 + d, w1 := s.v.w1 } }` — the
-`w1 := s.v.w1` sibling-limb read in the ok-state is a known extractor FC).
-The `bindWideUint*` statements are target-owned — the Lean extractor flattens
-`UInt128`/`UInt256` values into scalar limbs rather than emitting wide ops, so
-wide arithmetic must be expressed in a hand-built Plan (see `Tests/PsyWide`).
-Full-constructor wide updates (`{ v := { w0 := a, w1 := b } }` with literal or
-param limbs) and wide views (init/get) work end-to-end (see
-`Examples/Psy/WideCounter`).
+typed error payloads, aggregate parameters, source-level UInt128/256
+arithmetic that reads a sibling limb inside a mutating update, and signed
+narrow arithmetic (`narrowSigned*` is a documented Plan-level boundary).
+The `bindWideUint*` and `narrowChecked*` statements are target-owned — the
+Lean extractor flattens wrapper/narrow values into scalar leaves rather than
+emitting width-aware ops, so they are exercised by hand-built Plans
+(`Tests/PsyWide`, `Tests/PsyNarrow`). Full-constructor wide updates and
+wide/narrow views work end-to-end (`Examples/Psy/WideCounter`,
+`Examples/Psy/NarrowProbe`). BoundedVec state-field flattening
+(`vec_length` + `vec_values_i` leaves) extracts correctly through
+elaboration-time verification (`Examples/Psy/BVecStateProbe`); the
+standalone `pf --module` CLI import path still fail-closes on
+wrapper-ctor record inits (opaque-term visibility gap in the CLI
+importModules env — documented boundary).
 
 ## Trust boundary
 
