@@ -80,6 +80,10 @@ private partial def validateStatements (stmts : Array Statement) : Except String
     match stmt with
     | .store _ value | .returnValue value =>
         validateExpr value
+    | .returnAggregate values =>
+        if values.isEmpty || values.size > 8 then
+          planError "aggregate return arity must be 1..8"
+        for v in values do validateExpr v
     | .assert condition | .assertWithMessage condition _ =>
         validateExpr condition
     | .returnNone => pure ()
@@ -104,6 +108,7 @@ private partial def validateStatements (stmts : Array Statement) : Except String
 private partial def returnsAnywhere (stmts : Array Statement) : Bool :=
   stmts.any fun
     | .returnValue _ => true
+    | .returnAggregate _ => true
     | .ifThenElse _ t e => returnsAnywhere t || returnsAnywhere e
     | _ => false
 

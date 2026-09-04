@@ -770,6 +770,14 @@ private def variantFragment (typeName name : String) (place : Core.Place)
     }
   return { leaves }
 
+/-- Compiler-known fixed-frame wrapper records (Core.Value): BoundedVec /
+    BoundedBytes / BoundedString. Not project-local, but their leaves flatten
+    exactly like records (length scalar + fixed element slots). -/
+private def isCompilerKnownWrapper (env : Environment) (tyName : Name) : Bool :=
+  tyName == ``ProofForge.Core.Value.BoundedVec ||
+    tyName == ``ProofForge.Core.Value.BoundedBytes ||
+    tyName == ``ProofForge.Core.Value.BoundedString
+
 private def leafSchema (env : Environment) (fuel : Nat) (name : String)
     (place : Core.Place) (ty : Expr) : Except String SchemaFragment :=
   match fuel with
@@ -842,7 +850,8 @@ private def leafSchema (env : Environment) (fuel : Nat) (name : String)
         .ok (optionFragment name place)
       else if let some payloadWidth := uint64VariantPayloadWidth? env tyName then
         .ok (variantFragment tyName.toString name place payloadWidth)
-      else if isUserName env tyName && isStructure env tyName &&
+      else if (isUserName env tyName || isCompilerKnownWrapper env tyName) &&
+          isStructure env tyName &&
           !(isEnumLeaf env tyName) && !(isOptionLikeInductive env tyName) then
         if !(getStructureParentInfo env tyName).isEmpty then
           .error s!"extract/unsupported: field {name} record inheritance"
@@ -850,6 +859,28 @@ private def leafSchema (env : Environment) (fuel : Nat) (name : String)
           let fields := getStructureFields env tyName
           if fields.isEmpty then
             .error s!"extract/unsupported: field {name} record has no fields"
+          else if isCompilerKnownWrapper env tyName then
+            -- Compiler-known fixed-frame wrappers: `length : UInt32` leaf +
+            -- `values : Vector elemTy capacity` flattened with the use-site
+            -- element type. (Generic param instantiation is out of scope;
+            -- these three wrappers are enumerated.)
+            Id.run do
+              let args := ty.getAppArgs
+              let isVec := tyName == ``ProofForge.Core.Value.BoundedVec
+              let elemTy : Expr :=
+                (if isVec then args.getD (args.size - 2) (.const ``UInt64 [])
+                else (.const ``UInt8 []))
+              let mut acc : SchemaFragment := {}
+              let lengthPlace := place.push (.field tyName.toString 0 "length")
+              match leafSchema env fuel' s!"{name}_length" lengthPlace (.const ``UInt32 []) with
+              | .error r => return .error r
+              | .ok lenFrag => acc := { acc with leaves := acc.leaves ++ lenFrag.leaves }
+              for i in List.range 32 do
+                let itemPlace := place.push (.field tyName.toString 1 "values") |>.push (.index i)
+                match leafSchema env fuel' s!"{name}_values_{i}" itemPlace elemTy with
+                | .error r => return .error r
+                | .ok item => acc := { acc with leaves := acc.leaves ++ item.leaves }
+              return .ok acc
           else
             Id.run do
               let mut acc : SchemaFragment := {}

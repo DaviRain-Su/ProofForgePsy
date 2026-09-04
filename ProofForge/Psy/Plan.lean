@@ -77,6 +77,9 @@ inductive Statement where
   | assert (condition : Expr)
   | assertWithMessage (condition : Expr) (message : String)
   | returnValue (value : Expr)
+  /-- Multi-value return (B-RET-ABI): 2..8 Felt leaves packed as one Psy
+      `[Felt; N]` return value. -/
+  | returnAggregate (values : Array Expr)
   | returnNone
   | ifThenElse (condition : Expr) (thenBody elseBody : Array Statement)
   /-- Bounded `for` static unroll (PSY-LOOP): `maxIterations` guarded steps
@@ -181,6 +184,8 @@ private partial def renderStmts (indent : String) (stmts : Array Statement) : St
     | .assert c => s!"{indent}assert {renderExpr c}{nl}"
     | .assertWithMessage c m => s!"{indent}assert {renderExpr c} : {m}{nl}"
     | .returnValue v => s!"{indent}ret {renderExpr v}{nl}"
+    | .returnAggregate vs =>
+        s!"{indent}ret [{String.intercalate ", " ((vs.map renderExpr).toList)}]{nl}"
     | .returnNone => s!"{indent}ret{nl}"
     | .ifThenElse c thn els =>
         let thnText := renderStmts (indent ++ "  ") thn

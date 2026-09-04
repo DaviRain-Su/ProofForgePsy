@@ -1129,6 +1129,16 @@ partial def lowerStmtsV1 (b : BuilderV1) (params : Array WireV1)
       | .returnValue value => do
           let (b1, vw) ← lowerExprV1 b params value
           pure { builder := b1, returnWires := #[vw] }
+      | .returnAggregate values => do
+          unless values.size ≥ 1 && values.size ≤ 8 do
+            planError s!"aggregate return arity must be 1..8, got {values.size}"
+          let mut bCur := b
+          let mut wires : Array WireV1 := #[]
+          for v in values do
+            let (b1, w) ← lowerExprV1 bCur params v
+            bCur := b1
+            wires := wires.push w
+          pure { builder := bCur, returnWires := wires }
       | .returnNone =>
           pure { builder := b, returnWires := #[] }
       | .assert cond => do

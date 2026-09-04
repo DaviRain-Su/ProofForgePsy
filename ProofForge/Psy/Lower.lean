@@ -370,7 +370,9 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
   let mut cur := st
   let ops := if foldableErrorTail ops then ops.pop else ops
   for op in ops do
-    if cur.returned then
+    -- A second consecutive value return folds into the aggregate; any other
+    -- op after a return is rejected.
+    if cur.returned && !(match op with | .returnU64 _ => true | _ => false) then
       return ← lowerError "statements after return"
     match op with
     | .letLocal i v =>
@@ -524,7 +526,21 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         out := out.push (.externalCall callee argExprs)
     | .returnU64 v => do
         let e ← valToExpr ctx cur.env v
-        out := out.push (.returnValue e)
+        let foldWith (prev : Statement) : Except String (Option Statement) :=
+          match prev with
+          | .returnValue p => pure (some (.returnAggregate #[p, e]))
+          | .returnAggregate ps =>
+              if ps.size ≥ 8 then
+                .error "psy/lower: aggregate return exceeds 8 leaves"
+              else pure (some (.returnAggregate (ps.push e)))
+          | _ => pure none
+        let folded : Option Statement ←
+          match out.back? with
+          | some prev => foldWith prev
+          | none => pure none
+        match folded with
+        | some agg => out := out.pop; out := out.push agg
+        | none => out := out.push (.returnValue e)
         cur := { cur with returned := true }
     | .returnState _ =>
         return ← lowerError "returnState outside init"
