@@ -73,11 +73,16 @@ Bare names map to in-tree `Examples.Psy` fixtures; user projects pass
 Admitted: single-leaf / multi-leaf `UInt64`/`Bool` scalar state, checked
 UInt64 arithmetic (add/sub/mul/div/mod), bitwise ops, compares, select,
 shl/shr, checked bitwise-not, DPN context reads (`psyUserId`, …),
-if/else with select-merged returns and stores, fixed vectors (static index).
+if/else with select-merged returns and stores, fixed vectors (static index),
+and G5-WIDE `UInt128`/`UInt256` state slots (multi-limb fields flatten to one
+`UInt64` leaf per 32-bit limb; checked wide mul/div/mod/shift lower through
+target-owned `bindWideUint*` bindings, exercised by hand-built Plans).
 
 Fail-closed (rejected at lowering): dynamic vector indices, state loops,
-typed error payloads, aggregate/multi-value returns, aggregate parameters,
-wide (UInt128/256) state slots.
+typed error payloads, aggregate/multi-value returns, aggregate parameters.
+The `bindWideUint*` statements are target-owned — the Lean extractor flattens
+`UInt128`/`UInt256` values into scalar limbs rather than emitting wide ops, so
+wide arithmetic must be expressed in a hand-built Plan (see `Tests/PsyWide`).
 
 ## Trust boundary
 
