@@ -216,6 +216,22 @@ private unsafe def extractPsyPlans (units : Array BuildUnit) :
       pure acc
     let allDirs : List System.FilePath :=
       (← Lean.searchPathRef.get) ++ envDirs.toList
+    -- The sysroot (last search entry) always resolves last and is never
+    -- shadowed, so toolchain modules (Init/Std/Lean — gigabytes with parts)
+    -- must not be copied into the merged view; CI runners run out of disk.
+    let sysroot? : Option System.FilePath ←
+      try
+        let p ← IO.FS.realPath (← Lean.findSysroot)
+        pure (some p)
+      catch _ => pure none
+    let inSysroot (olean : System.FilePath) : Bool :=
+      match sysroot? with
+      | some root =>
+          let o := olean.toString
+          let r := root.toString
+          let rSep := if r.endsWith "/" then r else r ++ "/"
+          o.startsWith rSep
+      | none => false
     let mut visited : Std.HashSet Lean.Name := {}
     let mut queue : Array Lean.Name := units.map (·.module)
     let mut missing : Array Lean.Name := #[]
@@ -236,7 +252,10 @@ private unsafe def extractPsyPlans (units : Array BuildUnit) :
       match found with
       | none => missing := missing.push mod
       | some olean =>
-        artifacts := artifacts.push (mod, olean, olean.withExtension "ilean")
+        -- Toolchain modules stay on the sysroot; only project/common modules
+        -- enter the merged view.
+        unless inSysroot olean do
+          artifacts := artifacts.push (mod, olean, olean.withExtension "ilean")
         -- Walk the closure via the ilean's `directImports` (present for every
         let ilean := olean.withExtension "ilean"
         try
