@@ -479,14 +479,27 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
     | .okState v => do
         match cur.pending with
         | some checked =>
-            let dest := implicitDestLeaf ctx v
-            out := out.push (.store dest checked)
-            if ctx.retCount ≥ 1 then
-              out := out.push (.returnValue (.stateLoad dest))
+            if !cur.sawStore then
+              -- Guard-folded shape only (no explicit store ran): store the
+              -- checked result, return the post-store read (canonical
+              -- `increment` shape).
+              let dest := implicitDestLeaf ctx v
+              out := out.push (.store dest checked)
+              if ctx.retCount ≥ 1 then
+                out := out.push (.returnValue (.stateLoad dest))
+              else
+                out := out.push .returnNone
+            else if ctx.retCount ≥ 1 then
+              -- Explicit storeField(s) already materialized every leaf;
+              -- storing the pending expr again would double-write (and for
+              -- cross-referencing stores, write the WRONG leaf).
+              out := out.push (.returnValue (← valToExpr ctx cur.env v))
             else
               out := out.push .returnNone
         | none =>
             if !cur.sawStore then
+              -- No explicit storeField: okState carries the state update
+              -- implicitly (Core.Eval's implicit-destination convention).
               let dest := implicitDestLeaf ctx v
               let ev ← valToExpr ctx cur.env v
               out := out.push (.store dest ev)

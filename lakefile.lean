@@ -5,9 +5,10 @@ package «proofforge-psy» where
   version := v!"0.0.1"
 
 /-- Shared Attr + Core/Crypto surface, maintained in ProofForgeCommon.
-    Bump the pin when ProofForgeCommon publishes a new Core/Crypto change. -/
+    Tracks ProofForgeCommon main; Common CI gates every push, so a
+    -- breakage surfaces in these repositories' CI immediately. -/
 require «proofforge-common» from git
-  "https://github.com/DaviRain-Su/ProofForgeCommon.git" @ "v0.1.0"
+  "https://github.com/DaviRain-Su/ProofForgeCommon.git" @ "main"
 
 /-- Contract-facing Psy SDK: the DPN execution-context leaves the extractor
     recognizes by name. No compiler machinery. -/
