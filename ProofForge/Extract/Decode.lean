@@ -1317,6 +1317,11 @@ private partial def flattenInitValue (env : Environment) (fuel : Nat) (ty e : Ex
       else if tyName? == some ``ProofForge.Core.Value.UInt128 then
         let (w0, w1) := uint128Leaves env e
         some #[w0, w1]
+      else if tyName? == some ``ProofForge.Core.Value.BoundedVec ||
+          tyName? == some ``ProofForge.Core.Value.BoundedBytes ||
+          tyName? == some ``ProofForge.Core.Value.BoundedString then
+        -- length leaf + capacity value slots (target-neutral fixed frame).
+        asBoundedCtorFields env e
       else if tyName? == some ``ProofForge.Core.Value.FixedBytes then
         let (w0, w1, w2, w3) := uint256Leaves env e
         some #[w0, w1, w2, w3]
@@ -1496,6 +1501,16 @@ private partial def flattenLeaves (env : Environment) (base : String) (e : Expr)
               -- projection only inherits that field; reducing it through the constructor would
               -- replay a transition rather than describe an outer write.
               let fieldTy? := fieldTypeExpr env c.induct names[i]
+              let isWrapperField :=
+                match fieldTy? with
+                | some ty =>
+                    (ty.consumeMData.getAppFn.constName? ==
+                      some ``ProofForge.Core.Value.BoundedVec) ||
+                    (ty.consumeMData.getAppFn.constName? ==
+                      some ``ProofForge.Core.Value.BoundedBytes) ||
+                    (ty.consumeMData.getAppFn.constName? ==
+                      some ``ProofForge.Core.Value.BoundedString)
+                | none => false
               let isUInt128Field :=
                 match fieldTy? with
                 | some ty => isUInt128Type ty
@@ -1506,6 +1521,23 @@ private partial def flattenLeaves (env : Environment) (base : String) (e : Expr)
                 | none => false
               if inheritedFromAppliedBase then
                 pure ()
+              else if isWrapperField then
+                -- length scalar + fixed value slots (wrapper record flatten).
+                let mut wrapperAcc : Array (String × Ops.Val) := #[]
+                match userCtorFields env nestedArg with
+                | some wfs =>
+                    if wfs.size == 2 then
+                      for (wname, wval) in flattenLeaves env child nestedArg appliedBases do
+                        wrapperAcc := wrapperAcc.push (wname, wval)
+                | none => pure ()
+                if wrapperAcc.isEmpty then
+                  match val env nestedArg with
+                  | some v =>
+                      unless looksUnchangedField v child || looksUnchangedField v fname do
+                        acc := acc.push (child, v)
+                  | none => pure ()
+                else
+                  acc := acc ++ wrapperAcc
               else if isUInt128Field then
                 let (w0, w1) := uint128Leaves env nestedArg
                 let l0 := s!"{child}_w0"

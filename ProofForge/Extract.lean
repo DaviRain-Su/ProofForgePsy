@@ -892,7 +892,15 @@ private def leafSchema (env : Environment) (fuel : Nat) (name : String)
               match leafSchema env fuel' s!"{name}_length" lengthPlace (.const ``UInt32 []) with
               | .error r => return .error r
               | .ok lenFrag => acc := { acc with leaves := acc.leaves ++ lenFrag.leaves }
-              for i in List.range 32 do
+              let capacity : Nat :=
+                match ty.getAppArgs[ty.getAppArgs.size - 1]? with
+                | some capArg => match asLit 8 capArg with
+                  | some (.lit n) => n.toNat
+                  | _ => 0
+                | none => 0
+              if capacity == 0 then
+                return .error s!"extract/unsupported: field {name} wrapper capacity is not a literal"
+              for i in List.range capacity do
                 let itemPlace := place.push (.field tyName.toString 1 "values") |>.push (.index i)
                 match leafSchema env fuel' s!"{name}_values_{i}" itemPlace elemTy with
                 | .error r => return .error r
