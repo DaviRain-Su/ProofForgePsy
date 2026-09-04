@@ -145,6 +145,9 @@ structure Ctx where
   isInit : Bool
   /-- Public scalar result count (0 = unit). -/
   retCount : Nat
+  /-- Whole-state operand convention: leaf to read when a value position
+      carries the whole state (Core.Eval implicit-value). -/
+  wholeLeaf : Option Nat := none
 
 /-- Local lexical environment: extractor local index → Plan expression. -/
 abbrev LocalEnv := Array (Nat × Expr)
@@ -159,7 +162,7 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
   | .lit n => pure (.literal n)
   | .arg i =>
       if !ctx.isInit && i == ctx.paramCount then
-        lowerError "whole-state value is not a scalar (project a field)"
+        pure (.stateLoad (ctx.wholeLeaf.getD 0))
       else if i < ctx.paramCount then
         pure (.param i)
       else
@@ -477,15 +480,19 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         -- arm); failing closed here would reject canonical
         -- `if c then (let x := …; store x) else revert` guard shapes.
         -- Branch-private bindings (a local bound in exactly one arm) are
-        -- admissible when the opposing arm is a lone trap: the trap path
-        -- never joins, so the binding dies with the arm (canonical
-        -- `if c then (let x := …; …) else revert` guard shape). Otherwise
-        -- require symmetric binding (unsound otherwise).
+        -- admissible when the join point cannot observe the binding: the
+        -- opposing arm is a lone trap (never joins) or both arms return
+        -- (the merge output is the return wire; post-branch code is dead).
+        -- Otherwise require symmetric binding (unsound otherwise).
         let opposingTrap := isLoneTrap thnStmts || isLoneTrap elsStmts
+        let bothReturn :=
+          (thnStmts.any fun | .returnValue _ | .returnAggregate _ => true | _ => false) &&
+          (elsStmts.any fun | .returnValue _ | .returnAggregate _ => true | _ => false)
+        let unobservable := opposingTrap || bothReturn
         let keys :=
           (((thnSt.env.map (·.1)) ++ (elsSt.env.map (·.1))).toList.eraseDups).filter
             fun i =>
-              if opposingTrap then
+              if unobservable then
                 -- a one-sided binding is fine; a two-sided one still merges
                 (thnSt.env.find? (·.1 == i)).isSome &&
                   (elsSt.env.find? (·.1 == i)).isSome
@@ -502,7 +509,7 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
                 match before? with
                 | some old => pure old
                 | none =>
-                    if opposingTrap then pure (ee?.getD (.literal 0))
+                    if unobservable then pure (ee?.getD (.literal 0))
                     else lowerError s!"local {i} bound in the then branch only"
           let ee ←
             match ee? with
@@ -511,7 +518,7 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
                 match before? with
                 | some old => pure old
                 | none =>
-                    if opposingTrap then pure te
+                    if unobservable then pure te
                     else lowerError s!"local {i} bound in the else branch only"
           unless te == ee do
             merged := merged.filter (·.1 != i) |>.push (i, Expr.select condExpr te ee)
@@ -564,9 +571,20 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
     | .storeField name value => do
         let some idx := ctx.leafIndexOf name
           | return ← lowerError s!"unknown state leaf {name}"
-        let ev ← valToExpr ctx cur.env value
-        out := out.push (.store idx ev)
-        cur := { cur with sawStore := true }
+        let isWholeState :=
+          match value with
+          | .arg i => !ctx.isInit && i == ctx.paramCount
+          | _ => false
+        if isWholeState then
+          -- Core.Eval's implicit-value convention: a whole-state operand in
+          -- a leaf store is the new state's own projection — the leaf's
+          -- current (post-prior-store) value. Store the read-back.
+          out := out.push (.store idx (.stateLoad idx))
+          cur := { cur with sawStore := true }
+        else
+          let ev ← valToExpr { ctx with wholeLeaf := some idx } cur.env value
+          out := out.push (.store idx ev)
+          cur := { cur with sawStore := true }
     | .okState v => do
         match cur.pending with
         | some checked =>
@@ -584,7 +602,8 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
               -- Explicit storeField(s) already materialized every leaf;
               -- storing the pending expr again would double-write (and for
               -- cross-referencing stores, write the WRONG leaf).
-              out := out.push (.returnValue (← valToExpr ctx cur.env v))
+              out := out.push (.returnValue
+                (← valToExpr { ctx with wholeLeaf := some (implicitDestLeaf ctx v) } cur.env v))
             else
               out := out.push .returnNone
         | none =>
@@ -595,7 +614,8 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
               let ev ← valToExpr ctx cur.env v
               out := out.push (.store dest ev)
             if ctx.retCount ≥ 1 then
-              out := out.push (.returnValue (← valToExpr ctx cur.env v))
+              out := out.push (.returnValue
+                (← valToExpr { ctx with wholeLeaf := some (implicitDestLeaf ctx v) } cur.env v))
             else
               out := out.push .returnNone
         cur := { cur with pending := none, returned := true }
