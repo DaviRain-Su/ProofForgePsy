@@ -252,7 +252,13 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         | .imtSet => .imtSet (atIdx 0) (atIdx 1)
         | .imtGetExternal => .imtGetExternal (atIdx 0) (atIdx 1)
         | .imtGetOther => .imtGetOther (atIdx 0) (atIdx 1) (atIdx 2)
-        | .imtContainsOther => .imtContainsOther (atIdx 0) (atIdx 1) (atIdx 2))
+        | .imtContainsOther => .imtContainsOther (atIdx 0) (atIdx 1) (atIdx 2)
+        | .mapGet | .mapPut =>
+            -- Dense Map state requires a language-level Map surface (the
+            -- official custom DSL); plain-Lean sources express it via the
+            -- SDK once the state carries the 24 pilot leaves.
+            return ← lowerError "pf.map.* requires a Map state field; the \
+plain-Lean source surface does not yet declare one (DPN-5 pilot deferred)"
 
 
 private def isErrorTerminal : SrcOp → Bool

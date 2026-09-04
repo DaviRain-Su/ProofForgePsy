@@ -86,6 +86,21 @@ CSE dedups to one circuit op). -/
 @[irreducible] def hashTwoToOneFull (args : Array UInt64) (limb : UInt64) : UInt64 :=
   hashTwoToOne args
 
+/-!
+## pf.map.* — dense Map UInt64 UInt64 pilot (DPN-5, capacity 8)
+
+`pf.map.get(k)` / `pf.map.put(k, v)` over the contract's declared
+`Map UInt64 UInt64` state. Core.Eval implicit-value convention applies to
+the map operand; the Plan lowering expands the 8-entry occupancy scan
+(match-hit / first-empty select tree, official mapLookup/mapUpsert shape).
+-/
+
+/-- `pf.map.get(k)`: value at `k`, 0 when absent. -/
+@[irreducible] def mapGet (k : UInt64) : UInt64 := k
+
+/-- `pf.map.put(k, v)`: upsert; returns `v` (map-full traps at proof time). -/
+@[irreducible] def mapPut (k v : UInt64) : UInt64 := v
+
 /-- `pf.imt.get(key)`: self-contract current IMT value at `key`. -/
 @[irreducible] def imtGet (_key : UInt64) : UInt64 := _key
 

@@ -17,6 +17,9 @@ inductive ValKind where
   | ctxSessionProofTreeRoot
   /-- DPN event record effect (event name is source metadata). -/
   | psyEvent
+  /-- Dense Map UInt64 UInt64 pilot (capacity 8, 24 leaves). -/
+  | mapGet
+  | mapPut
   /-- pf.crypto gadgets (scalar first-limb ABI). Operands carry the args. -/
   | cryptoHashNoPad
   | cryptoHashPad
@@ -49,6 +52,8 @@ def ValKind.arity : ValKind → Nat :=
     | .cryptoKeccak256 => 16
     | .cryptoHashNoPadLimb | .cryptoHashTwoToOneLimb => 9
     | .imtGet | .imtContains | .imtSet => 2
+    | .mapGet => 1
+    | .mapPut => 2
     | .imtGetExternal => 2
     | .imtGetOther | .imtContainsOther => 3
 
