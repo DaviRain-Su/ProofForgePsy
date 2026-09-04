@@ -107,6 +107,13 @@ private partial def returnsAnywhere (stmts : Array Statement) : Bool :=
     | .ifThenElse _ t e => returnsAnywhere t || returnsAnywhere e
     | _ => false
 
+/-- A lone trap arm (`assertWithMessage false "revert[:name]"`) traps before
+    any later return, so it counts as a returning path for arity purposes. -/
+private def isLoneTrapArm : Array Statement → Bool
+  | #[.assertWithMessage (.boolLiteral false) msg] =>
+      msg == "revert" || msg.startsWith "revert:"
+  | _ => false
+
 
 /-- Return-form consistency: a branch that returns must be matched by the
     other arm (the DPN lowerer merges returns through `Select` and rejects
@@ -115,7 +122,9 @@ private partial def checkReturnForms (stmts : Array Statement) : Except String U
   for stmt in stmts do
     match stmt with
     | .ifThenElse _ thenBody elseBody =>
-        if returnsAnywhere thenBody != returnsAnywhere elseBody then
+        let thnReturns := returnsAnywhere thenBody || isLoneTrapArm thenBody
+        let elsReturns := returnsAnywhere elseBody || isLoneTrapArm elseBody
+        if thnReturns != elsReturns then
           planError "if arms must both return or neither"
         checkReturnForms thenBody
         checkReturnForms elseBody

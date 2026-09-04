@@ -334,23 +334,30 @@ private structure SeqState where
   returned : Bool := false
   deriving Inhabited
 
-/-- A lone trap arm: one gated `assertWithMessage false "revert"`. -/
+/-- A lone trap arm: one gated `assertWithMessage false "revert[:name]"`
+    (the PSY-TYPED-ERROR zero-arg revert tags the constructor name). -/
 private def isLoneTrap : Array Statement → Bool
-  | #[.assertWithMessage (.boolLiteral false) "revert"] => true
+  | #[.assertWithMessage (.boolLiteral false) msg] => msg == "revert" || msg.startsWith "revert:"
   | _ => false
 
 /-- Balance guard-style branches: when exactly one arm is a lone trap and the
     other returns, give the trap arm a dead `returnValue 0` so DPN return
     arity stays symmetric (the trap fires first at proof time). -/
+private partial def returnsAnywhereDeep (stmts : Array Statement) : Bool :=
+  stmts.any fun
+    | .returnValue _ => true
+    | .ifThenElse _ t e => returnsAnywhereDeep t || returnsAnywhereDeep e
+    | _ => false
+
 private def balanceTrapArms (thn els : Array Statement) :
     Array Statement × Array Statement :=
   match isLoneTrap thn, isLoneTrap els with
   | true, false =>
-      if els.any (fun | .returnValue _ => true | _ => false) then
+      if returnsAnywhereDeep els then
         (thn.push (.returnValue (.literal 0)), els)
       else (thn, els)
   | false, true =>
-      if thn.any (fun | .returnValue _ => true | _ => false) then
+      if returnsAnywhereDeep thn then
         (thn, els.push (.returnValue (.literal 0)))
       else (thn, els)
   | _, _ => (thn, els)
@@ -490,8 +497,10 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         cur := { cur with pending := none, returned := true }
     | .errorOverflow =>
         out := out.push (.assertWithMessage (.boolLiteral false) "revert")
-    | .errorNamed _ =>
-        out := out.push (.assertWithMessage (.boolLiteral false) "revert")
+    | .errorNamed name =>
+        -- PSY-TYPED-ERROR: zero-arg named revert tags the constructor name
+        -- in the DPN assert record (structured payloads stay FC).
+        out := out.push (.assertWithMessage (.boolLiteral false) s!"revert:{name}")
     | .errorTyped _ =>
         return ← lowerError "typed error payloads are not admitted in the psy-dpn-v1 slice"
     | .emitEvent name payload => do
