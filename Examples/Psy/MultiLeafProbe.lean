@@ -44,3 +44,4 @@ def cross (s : State) : Except Error (State × UInt64) :=
 end Examples.Psy.MultiLeafProbe
 
 #pf_psy_dump Examples.Psy.MultiLeafProbe
+#pf_psy_dump Examples.Psy.MultiLeafProbe

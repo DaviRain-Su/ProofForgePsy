@@ -2046,8 +2046,14 @@ private partial def rewritePlainLoopOp (op : Ops.Op) : Ops.Op :=
   | .forBody n body => .forBody n (body.map rewritePlainLoopOp)
   | op => op
 
-private def findForIn (env : Environment) (e : Expr) : Option (Nat × Ops.Val) :=
-  let rec go (fuel : Nat) (e : Expr) : Option (Nat × Ops.Val) :=
+/-- Decoded bounded `for` info: bound, addend, optional accumulator init. -/
+structure ForInInfo where
+  bound : Nat
+  addend : Ops.Val
+  init : Option Ops.Val
+
+private def findForIn (env : Environment) (e : Expr) : Option ForInInfo :=
+  let rec go (fuel : Nat) (e : Expr) : Option ForInInfo :=
     match fuel with
     | 0 => none
     | fuel' + 1 =>
@@ -2083,9 +2089,11 @@ private def findForIn (env : Environment) (e : Expr) : Option (Nat × Ops.Val) :
               | .letE _ _ value body _ => findAdd fuel' value <|> findAdd fuel' body
               | _ => e.getAppArgs.findSome? (findAdd fuel')
         let addend? := args.findSome? (findAdd 16)
+        -- The forIn accumulator INIT is the arg immediately before the
+        -- range/list (the 2nd-to-last value arg). Default 0 when absent.
         match n?, addend? with
         | some n, some v =>
-          if n = 0 || n > 64 then none else some (n, v)
+          if n = 0 || n > 64 then none else some (ForInInfo.mk n v none)
         | _, _ => none
       else if isConstNamed e ``ite || isConstNamed e ``dite then none
       else
@@ -3314,8 +3322,9 @@ private def decodePlain (env : Environment) (e : Expr) (stateful : Bool)
     .ok (#[op] ++ (match findOkRet env e with
       | some v => #[.returnU64 v]
       | none => #[]))
-  else if let some (n, addend) := findForIn env e then
-    .ok #[.forAccum n addend localDepth, .returnU64 (.local localDepth)]
+  else if let some info := findForIn env e then
+    .ok #[.forAccum info.bound info.addend localDepth,
+      .returnU64 (.local localDepth)]
   else if let some result := asYieldStores env e localDepth stateType? deepScalars then
     result
   else if let some result := asInlineStateSuccess env e localDepth stateType? deepScalars then
@@ -3904,8 +3913,9 @@ def decodeExpr (env : Environment) (fuel : Nat) (e : Expr)
           (stateType? := stateType?) (deepScalars := deepScalars) with
       | .ok ops => return .ok ops
       | .error reason => return .error s!"extract/unsupported: inline {name}: {reason}"
-    else if let some (n, addend) := findForIn env e then
-      return .ok #[.forAccum n addend localDepth, .returnU64 (.local localDepth)]
+    else if let some info := findForIn env e then
+      return .ok #[.forAccum info.bound info.addend localDepth,
+        .returnU64 (.local localDepth)]
     else if let some (n, bodyE) := findForBodyExpr env e then
       match decodeExpr env fuel' bodyE (preserveLocals := preserveLocals)
           (localDepth := localDepth) (stateType? := stateType?)
@@ -4261,8 +4271,10 @@ def decodeExpr (env : Environment) (fuel : Nat) (e : Expr)
       -- `match opt with | none => a | some n => b` → ite (eq tag 0) a b。
       let args := e.getAppArgs
       let disc := args[args.size - 3]!
-      let noneE := peelLets args[args.size - 2]!
-      let someE := peelLets args[args.size - 1]!
+      -- Lean's Option match elaborates `match_1 motive disc (λv => some) (λ_ => none)`:
+      -- args[size-2] is the SOME handler, args[size-1] the NONE handler.
+      let someE := peelLets args[args.size - 2]!
+      let noneE := peelLets args[args.size - 1]!
       let tag :=
         match val env disc with
         | some (.field b n) =>

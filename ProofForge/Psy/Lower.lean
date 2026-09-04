@@ -360,6 +360,15 @@ private structure SeqState where
   sawStore : Bool := false
   /-- A value return already terminated this sequence. -/
   returned : Bool := false
+  /-- Most recent explicitly-stored leaf (whole-state placeholder reads
+      project this leaf's current value). -/
+  lastStoreLeaf? : Option Nat := none
+  /-- The value expr most recently stored (for post-store return folding). -/
+  lastStoreValue? : Option Expr := none
+  /-- Whether the immediately preceding op was a store. -/
+  justStored : Bool := false
+  /-- All stores in this sequence: (leaf index, stored value) pairs. -/
+  stores : List (Nat × Expr) := []
   deriving Inhabited
 
 /-- A lone trap arm: one gated `assertWithMessage false "revert[:name]"`
@@ -543,7 +552,11 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         -- (PSY-LOOP semantics: bound assert at DPN lowering + per-step traps).
         unless n ≤ maxUnrollSteps do
           return ← lowerError s!"forAccum bound {n} exceeds the unroll limit {maxUnrollSteps}"
-        let mut acc : Expr := .literal 0
+        let start : Expr :=
+          match cur.env.find? (·.1 == resultLocal) with
+          | some (_, e) => e
+          | none => .literal 0
+        let mut acc : Expr := start
         for k in [0:n] do
           let addendK ← valToExpr ctx cur.env (substituteLoopIxVal addend k)
           acc := .checkedAdd acc addendK
@@ -553,6 +566,9 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         -- State loop: unroll n guarded steps; loopIx inside the body becomes
         -- the literal step index. Body stores stay inside the step's branch
         -- statements (conditional under the step guard at DPN lowering).
+        -- The extractor tags a successful state loop with a trailing
+        -- `errorOverflow` marker ("loop completed"); it is NOT a trap — the
+        -- unrolled body already carries every checked trap. Drop it.
         unless n ≤ maxUnrollSteps do
           return ← lowerError s!"forBody bound {n} exceeds the unroll limit {maxUnrollSteps}"
         for k in [0:n] do
@@ -562,6 +578,9 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
           out := out.append stmtsK
           if stK.sawStore then
             cur := { stK with sawStore := true }
+        -- drop a single trailing errorOverflow marker
+        if out.back? == some (.assertWithMessage (.boolLiteral false) "revert") then
+          out := out.pop
         pure ()
     | .indexSetLeaf name idx value _ leaf => do
         -- Unresolved vector leaf — the extractor resolves these against the schema
@@ -595,7 +614,12 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         else
           let ev ← valToExpr { ctx with wholeLeaf := some idx } cur.env value
           out := out.push (.store idx ev)
-          cur := { cur with sawStore := true }
+          cur := { cur with
+            sawStore := true
+            lastStoreLeaf? := some idx
+            lastStoreValue? := some ev
+            justStored := true
+            stores := cur.stores ++ [(idx, ev)] }
     | .okState v => do
         match cur.pending with
         | some checked =>
@@ -612,9 +636,14 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
             else if ctx.retCount ≥ 1 then
               -- Explicit storeField(s) already materialized every leaf;
               -- storing the pending expr again would double-write (and for
-              -- cross-referencing stores, write the WRONG leaf).
-              out := out.push (.returnValue
-                (← valToExpr { ctx with wholeLeaf := some (implicitDestLeaf ctx v) } cur.env v))
+              -- cross-referencing stores, write the WRONG leaf). The
+              -- pending expr reads the PRE-store leaves; the correct
+              -- scalar return is the destination leaf's post-store read
+              -- (it already includes the pending delta). Re-emitting the
+              -- pending expr would read the already-written leaf and apply
+              -- the delta twice.
+              let dest := implicitDestLeaf ctx v
+              out := out.push (.returnValue (.stateLoad dest))
             else
               out := out.push .returnNone
         | none =>
@@ -624,9 +653,17 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
               let dest := implicitDestLeaf ctx v
               let ev ← valToExpr ctx cur.env v
               out := out.push (.store dest ev)
+              cur := { cur with stores := cur.stores ++ [(dest, ev)] }
             if ctx.retCount ≥ 1 then
-              out := out.push (.returnValue
-                (← valToExpr { ctx with wholeLeaf := some (implicitDestLeaf ctx v) } cur.env v))
+              let retE ← valToExpr { ctx with wholeLeaf := some (implicitDestLeaf ctx v) } cur.env v
+              -- Post-store return folding (same rule as returnU64): a
+              -- return equal to the just-stored value becomes the
+              -- post-store leaf read.
+              let retE :=
+                match cur.stores.find? (fun (_, sv) => sv == retE) with
+                | some (leaf, _) => .stateLoad leaf
+                | none => retE
+              out := out.push (.returnValue retE)
             else
               out := out.push .returnNone
         cur := { cur with pending := none, returned := true }
@@ -645,7 +682,15 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         let argExprs ← args.mapM (valToExpr ctx cur.env)
         out := out.push (.externalCall callee argExprs)
     | .returnU64 v => do
-        let e ← valToExpr ctx cur.env v
+        let e0 ← valToExpr ctx cur.env v
+        -- Post-store return folding: if a store ran immediately before and
+        -- the returned value equals the stored value, the correct result is
+        -- the post-store leaf read (re-evaluating the expr would read the
+        -- already-written leaf and apply the delta twice).
+        let e :=
+          match cur.stores.find? (fun (_, sv) => sv == e0) with
+          | some (leaf, _) => .stateLoad leaf
+          | none => e0
         let foldWith (prev : Statement) : Except String (Option Statement) :=
           match prev with
           | .returnValue p => pure (some (.returnAggregate #[p, e]))
