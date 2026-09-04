@@ -31,7 +31,11 @@ private def validateExprNodes (expr : Expr) : Option Nat :=
   | .wideUintShiftLimb _ _ _ _ => some 1
   | .checkedAdd l r | .checkedSub l r | .checkedMul l r | .checkedDiv l r
   | .checkedMod l r | .bitAnd l r | .bitOr l r | .bitXor l r
-  | .shl l r | .shr l r => do
+  | .shl l r | .shr l r
+  | .narrowCheckedAdd _ l r | .narrowCheckedSub _ l r | .narrowCheckedMul _ l r
+  | .narrowCheckedDiv _ l r | .narrowCheckedMod _ l r
+  | .narrowBitAnd _ l r | .narrowBitOr _ l r | .narrowBitXor _ l r
+  | .narrowShl _ l r | .narrowShr _ l r => do
       let dl ← validateExprNodes l
       let dr ← validateExprNodes r
       if dl + dr + 1 > maxExprDepth then none else some (dl + dr + 1)
@@ -39,7 +43,7 @@ private def validateExprNodes (expr : Expr) : Option Nat :=
       let dl ← validateExprNodes l
       let dr ← validateExprNodes r
       if dl + dr + 1 > maxExprDepth then none else some (dl + dr + 1)
-  | .boolNot o | .checkedBitNot o => do
+  | .boolNot o | .checkedBitNot o | .narrowBitNot _ o => do
       let d ← validateExprNodes o
       if d + 1 > maxExprDepth then none else some (d + 1)
   | .select c t e => do

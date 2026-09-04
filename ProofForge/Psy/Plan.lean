@@ -88,17 +88,29 @@ inductive Expr where
   /-- Felt-valued conditional used to materialize carry/borrow without field
       division. `condition` is Bool; both branches are Felt expressions. -/
   | select (condition thenValue elseValue : Expr)
+  /-- Narrow UInt{8,16,32} checked arith as Felt + `result < 2^w` / underflow. -/
+  | narrowCheckedAdd (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowCheckedSub (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowCheckedMul (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowCheckedDiv (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowCheckedMod (bitWidth : Nat) (lhs rhs : Expr)
+  /-- Narrow UInt{8,16,32} bitwise (Felt; result stays in-range if operands do). -/
+  | narrowBitAnd (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowBitOr (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowBitXor (bitWidth : Nat) (lhs rhs : Expr)
+  /-- Narrow UInt{8,16,32} shift: `count < bitWidth` + post-shl width guard. -/
+  | narrowShl (bitWidth : Nat) (lhs rhs : Expr)
+  | narrowShr (bitWidth : Nat) (lhs rhs : Expr)
+  /-- Narrow UInt{8,16,32} bitwise-not (Felt; result in-range if operand is). -/
+  | narrowBitNot (bitWidth : Nat) (operand : Expr)
   /-- G5-WIDE: result limb `limbIndex` of a target-owned `bindWideUintMul`.
       Must appear in the same lexical statement region as the binding. -/
-  | wideUintMulLimb (bitWidth operationId limbIndex : Nat)
-  /-- G5-WIDE: result limb `limbIndex` of a `bindWideUintDivMod`. -/
   | wideUintDivModLimb (resultKind : WideUInt128DivModResultV1)
       (bitWidth operationId limbIndex : Nat)
-  /-- G5-WIDE: result limb `limbIndex` of a `bindWideUintShift`. -/
   | wideUintShiftLimb (kind : WideUInt128ShiftKindV1)
       (bitWidth operationId limbIndex : Nat)
+  | wideUintMulLimb (bitWidth operationId limbIndex : Nat)
   deriving BEq, Inhabited, Repr
-
 inductive Statement where
   | store (fieldIndex : Nat) (value : Expr)
   | assert (condition : Expr)
@@ -141,6 +153,10 @@ structure PlanParam where
   sourceIndex : Nat
   name : String
   isBool : Bool
+  /-- Unsigned width in bits: 0 or 64 → Felt UInt64; 8/16/32 → Felt-carried
+      narrow (entry range-checked). Historical `isU32` is recovered as
+      `uintWidth == 32`. -/
+  uintWidth : Nat := 0
   deriving BEq, Inhabited, Repr
 
 structure PlanFunction where
@@ -169,10 +185,12 @@ private def joinRepr (args : Array Expr) : String :=
 private def renderCallee (callee : Array String) : String :=
   String.intercalate "." callee.toList
 
-/-- Stable low-tech canonical rendering for registry digests. Not a JSON
-    round-trip: purely a fingerprint of the Plan content. -/
 private partial def renderExpr : Expr → String
   | .literal v => s!"lit {v}"
+  | .compare op l r =>
+      let op := match op with
+        | .lt => "<" | .le => "<=" | .eq => "==" | .ne => "!=" | .ge => ">=" | .gt => ">"
+      s!"({op} {renderExpr l} {renderExpr r})"
   | .boolLiteral v => s!"b {v}"
   | .param i => s!"p {i}"
   | .stateLoad i => s!"slot {i}"
@@ -181,10 +199,6 @@ private partial def renderExpr : Expr → String
   | .checkedMul l r => s!"(* {renderExpr l} {renderExpr r})"
   | .checkedDiv l r => s!"(/ {renderExpr l} {renderExpr r})"
   | .checkedMod l r => s!"(% {renderExpr l} {renderExpr r})"
-  | .compare op l r =>
-      let op := match op with
-        | .lt => "<" | .le => "<=" | .eq => "==" | .ne => "!=" | .ge => ">=" | .gt => ">"
-      s!"({op} {renderExpr l} {renderExpr r})"
   | .bitAnd l r => s!"(& {renderExpr l} {renderExpr r})"
   | .bitOr l r => s!"(| {renderExpr l} {renderExpr r})"
   | .bitXor l r => s!"(^ {renderExpr l} {renderExpr r})"
@@ -211,6 +225,17 @@ private partial def renderExpr : Expr → String
   | .imtGetExternal c k => s!"(imtGetExt {repr c} {repr k})"
   | .imtGetOther u c k => s!"(imtGetOther {repr u} {repr c} {repr k})"
   | .imtContainsOther u c k => s!"(imtHasOther {repr u} {repr c} {repr k})"
+  | .narrowCheckedAdd w l r => s!"(n+ {w} {renderExpr l} {renderExpr r})"
+  | .narrowCheckedSub w l r => s!"(n- {w} {renderExpr l} {renderExpr r})"
+  | .narrowCheckedMul w l r => s!"(n* {w} {renderExpr l} {renderExpr r})"
+  | .narrowCheckedDiv w l r => s!"(n/ {w} {renderExpr l} {renderExpr r})"
+  | .narrowCheckedMod w l r => s!"(n% {w} {renderExpr l} {renderExpr r})"
+  | .narrowBitAnd w l r => s!"(n& {w} {renderExpr l} {renderExpr r})"
+  | .narrowBitOr w l r => s!"(n| {w} {renderExpr l} {renderExpr r})"
+  | .narrowBitXor w l r => s!"(n^ {w} {renderExpr l} {renderExpr r})"
+  | .narrowShl w l r => s!"(n<< {w} {renderExpr l} {renderExpr r})"
+  | .narrowShr w l r => s!"(n>> {w} {renderExpr l} {renderExpr r})"
+  | .narrowBitNot w o => s!"(n~ {w} {renderExpr o})"
   | .wideUintMulLimb bw op li => s!"(wmul {bw} {op} {li})"
   | .wideUintDivModLimb kind bw op li =>
       let k := match kind with | .quotient => "q" | .remainder => "r"

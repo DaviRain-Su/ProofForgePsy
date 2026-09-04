@@ -686,6 +686,215 @@ private def emitUInt64Shr (b : BuilderV1) (l r : WireV1) :
   }
   let (b4, u) := pushU32 b3 .u32ShiftRight #[l.operand, r.operand]
   emitCastFelt b4 u
+/-- `2^w` bound for narrow UInt{8,16,32}. -/
+private def narrowBoundV1 (bitWidth : Nat) : Except String Nat :=
+  if bitWidth == 8 then pure 256
+  else if bitWidth == 16 then pure 65536
+  else if bitWidth == 32 then pure 4294967296
+  else planError s!"PSY-DPN-G5: narrow bitWidth {bitWidth} not admitted (need 8/16/32)"
+
+/-- `2^w − 1` mask for narrow bitNot (always a legal Goldilocks Felt). -/
+private def narrowMaskV1 (bitWidth : Nat) : Except String Nat :=
+  if bitWidth == 8 then pure 255
+  else if bitWidth == 16 then pure 65535
+  else if bitWidth == 32 then pure 4294967295
+  else planError s!"PSY-DPN-G5: narrow bitWidth {bitWidth} not admitted (need 8/16/32)"
+
+/-- Narrow checked add: `sum = l+r`; assert `sum < 2^w`. -/
+private def emitNarrowCheckedAdd (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let bound ← narrowBoundV1 bitWidth
+  let li ← asTargetIndex l
+  let ri ← asTargetIndex r
+  let (b1, sum) := pushTarget b .add #[UInt64.ofNat li, UInt64.ofNat ri]
+  let (b2, limW) := emitLiteralU64 b1 (UInt64.ofNat bound)
+  let limIdx ← asTargetIndex limW
+  let (b3, ok) :=
+    pushBool b2 .lt #[UInt64.ofNat sum.rawIndex, UInt64.ofNat limIdx]
+  let b4 := {
+    b3 with
+      asserts := b3.asserts.push {
+        left := ok.encoded
+        right := encodeIndexedId .bool b3.trueBool
+        message := s!"u{bitWidth} add overflow"
+      }
+  }
+  pure (b4, sum)
+
+/-- Narrow checked sub: assert `l >= r`, then `diff = l-r`. -/
+private def emitNarrowCheckedSub (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let _ ← narrowBoundV1 bitWidth
+  let li ← asTargetIndex l
+  let ri ← asTargetIndex r
+  let (b1, ok) := pushBool b .gte #[UInt64.ofNat li, UInt64.ofNat ri]
+  let b2 := {
+    b1 with
+      asserts := b1.asserts.push {
+        left := ok.encoded
+        right := encodeIndexedId .bool b1.trueBool
+        message := s!"u{bitWidth} sub underflow"
+      }
+  }
+  let (b3, diff) := pushTarget b2 .sub #[UInt64.ofNat li, UInt64.ofNat ri]
+  pure (b3, diff)
+
+/-- Narrow checked mul: `prod = l*r`; assert `prod < 2^w`. -/
+private def emitNarrowCheckedMul (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let bound ← narrowBoundV1 bitWidth
+  let li ← asTargetIndex l
+  let ri ← asTargetIndex r
+  let (b1, prod) := pushTarget b .mul #[UInt64.ofNat li, UInt64.ofNat ri]
+  let (b2, limW) := emitLiteralU64 b1 (UInt64.ofNat bound)
+  let limIdx ← asTargetIndex limW
+  let (b3, ok) :=
+    pushBool b2 .lt #[UInt64.ofNat prod.rawIndex, UInt64.ofNat limIdx]
+  let b4 := {
+    b3 with
+      asserts := b3.asserts.push {
+        left := ok.encoded
+        right := encodeIndexedId .bool b3.trueBool
+        message := s!"u{bitWidth} mul overflow"
+      }
+  }
+  pure (b4, prod)
+
+/-- Narrow checked div: assert `r > 0`, then `l / r`. -/
+private def emitNarrowCheckedDiv (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let _ ← narrowBoundV1 bitWidth
+  let li ← asTargetIndex l
+  let ri ← asTargetIndex r
+  let (b1, nonzero) :=
+    pushBool b .gt #[UInt64.ofNat ri, UInt64.ofNat b.zeroTarget]
+  let b2 := {
+    b1 with
+      asserts := b1.asserts.push {
+        left := nonzero.encoded
+        right := encodeIndexedId .bool b1.trueBool
+        message := s!"u{bitWidth} div by zero"
+      }
+  }
+  let (b3, q) := pushTarget b2 .div #[UInt64.ofNat li, UInt64.ofNat ri]
+  pure (b3, q)
+
+/-- Narrow checked mod: assert `r > 0`, then `l % r`. -/
+private def emitNarrowCheckedMod (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let _ ← narrowBoundV1 bitWidth
+  let li ← asTargetIndex l
+  let ri ← asTargetIndex r
+  let (b1, nonzero) :=
+    pushBool b .gt #[UInt64.ofNat ri, UInt64.ofNat b.zeroTarget]
+  let b2 := {
+    b1 with
+      asserts := b1.asserts.push {
+        left := nonzero.encoded
+        right := encodeIndexedId .bool b1.trueBool
+        message := s!"u{bitWidth} mod by zero"
+      }
+  }
+  let (b3, m) := pushTarget b2 .mod_ #[UInt64.ofNat li, UInt64.ofNat ri]
+  pure (b3, m)
+
+/-- Narrow bitAnd/Or/Xor: U32 op + CastFelt (same limb path as UInt64 bit*). -/
+private def emitNarrowBitwise (b : BuilderV1) (bitWidth : Nat) (op : OpTypeV1)
+    (l r : WireV1) : Except String (BuilderV1 × WireV1) := do
+  let _ ← narrowBoundV1 bitWidth
+  let (b1, u) := pushU32 b op #[l.operand, r.operand]
+  emitCastFelt b1 u
+
+/-- Narrow bitNot: Felt `x ^ (2^w−1)` via U32Xor + CastFelt. -/
+private def emitNarrowBitNot (b : BuilderV1) (bitWidth : Nat) (o : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let mask ← narrowMaskV1 bitWidth
+  let (b1, maskW) := emitLiteralU64 b (UInt64.ofNat mask)
+  let (b2, u) := pushU32 b1 .u32Xor #[o.operand, maskW.operand]
+  emitCastFelt b2 u
+
+/-- Narrow shl: assert `count < w`, then U32ShiftLeft + CastFelt and assert
+    `result < 2^w`. -/
+private def emitNarrowShl (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let bound ← narrowBoundV1 bitWidth
+  let ri ← asTargetIndex r
+  let (b1, wBound) := emitLiteralU64 b (UInt64.ofNat bitWidth)
+  let wi ← asTargetIndex wBound
+  let (b2, okCount) :=
+    pushBool b1 .lt #[UInt64.ofNat ri, UInt64.ofNat wi]
+  let b3 := {
+    b2 with
+      asserts := b2.asserts.push {
+        left := okCount.encoded
+        right := encodeIndexedId .bool b2.trueBool
+        message := s!"invalidShift: count >= {bitWidth}"
+      }
+  }
+  let (b4, u) := pushU32 b3 .u32ShiftLeft #[l.operand, r.operand]
+  let (b5, res) ← emitCastFelt b4 u
+  let resi ← asTargetIndex res
+  let (b6, limW) := emitLiteralU64 b5 (UInt64.ofNat bound)
+  let limi ← asTargetIndex limW
+  let (b7, okRes) :=
+    pushBool b6 .lt #[UInt64.ofNat resi, UInt64.ofNat limi]
+  let b8 := {
+    b7 with
+      asserts := b7.asserts.push {
+        left := okRes.encoded
+        right := encodeIndexedId .bool b7.trueBool
+        message := s!"u{bitWidth} shl overflow"
+      }
+  }
+  pure (b8, res)
+
+/-- Narrow shr: assert `count < w`, then U32ShiftRight + CastFelt. -/
+private def emitNarrowShr (b : BuilderV1) (bitWidth : Nat) (l r : WireV1) :
+    Except String (BuilderV1 × WireV1) := do
+  let _ ← narrowBoundV1 bitWidth
+  let ri ← asTargetIndex r
+  let (b1, wBound) := emitLiteralU64 b (UInt64.ofNat bitWidth)
+  let wi ← asTargetIndex wBound
+  let (b2, okCount) :=
+    pushBool b1 .lt #[UInt64.ofNat ri, UInt64.ofNat wi]
+  let b3 := {
+    b2 with
+      asserts := b2.asserts.push {
+        left := okCount.encoded
+        right := encodeIndexedId .bool b2.trueBool
+        message := s!"invalidShift: count >= {bitWidth}"
+      }
+  }
+  let (b4, u) := pushU32 b3 .u32ShiftRight #[l.operand, r.operand]
+  emitCastFelt b4 u
+/-- Entry range-check narrow UInt{8,16,32} params (`param < 2^w`). -/
+private def emitNarrowParamRangeAsserts (b : BuilderV1) (params : Array WireV1)
+    (paramMeta : Array PlanParam) : Except String BuilderV1 := do
+  let mut bCur := b
+  for i in [0:params.size] do
+    if let some p := paramMeta[i]? then
+      if p.uintWidth == 8 || p.uintWidth == 16 || p.uintWidth == 32 then
+        let bound ← narrowBoundV1 p.uintWidth
+        let (bLit, limW) := emitLiteralU64 bCur (UInt64.ofNat bound)
+        bCur := bLit
+        let limIdx ← asTargetIndex limW
+        match params[i]? with
+        | none => planError "PSY-DPN: narrow param wire missing"
+        | some w => do
+            let pi ← asTargetIndex w
+            let (b1, ok) :=
+              pushBool bCur .lt #[UInt64.ofNat pi, UInt64.ofNat limIdx]
+            bCur := {
+              b1 with
+                asserts := b1.asserts.push {
+                  left := ok.encoded
+                  right := encodeIndexedId .bool b1.trueBool
+                  message := s!"u{p.uintWidth} param out of range"
+                }
+            }
+  pure bCur
+
+
 
 /-- Assert bool wire equals ConstantTrue. -/
 private def pushAssertTrue (b : BuilderV1) (cond : WireV1) (msg : String) :
@@ -1185,6 +1394,49 @@ partial def lowerExprV1 (b : BuilderV1) (params : Array WireV1) :
       let (b2, cw) ← lowerExprV1 b1 params c
       let (b3, kw) ← lowerExprV1 b2 params k
       emitImtContainsOther b3 uw cw kw
+  | .narrowCheckedAdd w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowCheckedAdd b2 w lw rw
+  | .narrowCheckedSub w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowCheckedSub b2 w lw rw
+  | .narrowCheckedMul w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowCheckedMul b2 w lw rw
+  | .narrowCheckedDiv w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowCheckedDiv b2 w lw rw
+  | .narrowCheckedMod w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowCheckedMod b2 w lw rw
+  | .narrowBitAnd w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowBitwise b2 w .u32And lw rw
+  | .narrowBitOr w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowBitwise b2 w .u32Or lw rw
+  | .narrowBitXor w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowBitwise b2 w .u32Xor lw rw
+  | .narrowShl w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowShl b2 w lw rw
+  | .narrowShr w l r => do
+      let (b1, lw) ← lowerExprV1 b params l
+      let (b2, rw) ← lowerExprV1 b1 params r
+      emitNarrowShr b2 w lw rw
+  | .narrowBitNot w o => do
+      let (b1, ow) ← lowerExprV1 b params o
+      emitNarrowBitNot b1 w ow
   | .wideUintMulLimb _bitWidth operationId limbIndex => do
       let w ← lookupWideMul b operationId limbIndex
       pure (b, w)
@@ -1787,6 +2039,7 @@ def lowerFunctionGeneralV1 (fn : PlanFunction) (multiLeaf : Bool) :
   let (b0, paramWires) := emitParams nParams
   let b0 := { b0 with multiLeaf }
   let b1 := ensurePrelude b0
+  let b1 ← emitNarrowParamRangeAsserts b1 paramWires fn.params
   let writeCond := trueWire b1
   let res ← lowerStmtsV1 b1 paramWires writeCond fn.body.toList
   let outputs := encodeOutputs res.returnWires
