@@ -1,4 +1,6 @@
 import ProofForge
+import Lean
+open Lean
 
 namespace Examples.Psy.LoopProbe
 
@@ -43,6 +45,19 @@ def scale (s : State) : Except Error (State × UInt64) :=
     pure acc
   if t1 ≥ s.total then
     .ok ({ total := t1 }, t1)
+  else
+    .error .overflow
+
+/-- Loop variable in the addend: sums 0+1+2+3 = 6 into total. -/
+@[pf_entry]
+def sumIx (s : State) : Except Error (State × UInt64) :=
+  let t := Id.run do
+    let mut acc := s.total
+    for i in [0:4] do
+      acc := acc + i.toUInt64
+    pure acc
+  if t ≥ s.total then
+    .ok ({ total := t }, t)
   else
     .error .overflow
 

@@ -2058,13 +2058,25 @@ private def findForIn (env : Environment) (e : Expr) : Option (Nat × Ops.Val) :
       else if e.getAppFn.constName? == some ``ForIn.forIn || endsWith e ".forIn" then
         let args := e.getAppArgs
         let n? := args.findSome? (forRangeEnd env)
+        -- The loop variable (the range's lower bound binder in forIn over a
+        -- List.range spine) is not a Lean value; recognize conversion spines
+        -- rooted at it (`UInt64.ofNat i`, plain `i`) as `.loopIx`.
         let rec findAdd (fuel : Nat) (e : Expr) : Option Ops.Val :=
           match fuel with
           | 0 => none
           | fuel' + 1 =>
             let e := strip e
             if isConstNamed e ``HAdd.hAdd && e.getAppArgs.size ≥ 2 then
-              (asVal env 8 e.getAppArgs[e.getAppArgs.size - 1]!).map rewritePlainLoopIx
+              let args := e.getAppArgs
+              let rhs := strip args[args.size - 1]!
+              -- `UInt64.ofNat i` / `i.toUInt64` unwrap to the raw loop var.
+              let rhsVal :=
+                if isConstNamed rhs ``UInt64.ofNat || isConstNamed rhs ``UInt64.toNat ||
+                    isConstNamed rhs ``Nat.toUInt64 then
+                  some (.loopIx)
+                else
+                  (asVal env 8 args[args.size - 1]!).map rewritePlainLoopIx
+              rhsVal
             else
               match e with
               | .lam _ _ body _ => findAdd fuel' body

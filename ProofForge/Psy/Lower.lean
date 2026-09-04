@@ -373,6 +373,54 @@ private def balanceTrapArms (thn els : Array Statement) :
       else (thn, els)
   | _, _ => (thn, els)
 
+mutual
+/-- Local ids read by an op sequence (env lookups in operands / terminal
+    returns). Used to decide which branch-bound locals the continuation
+    actually consumes. -/
+partial def localReadsOps : Array SrcOp → Array Nat
+  | #[] => #[]
+  | ops => ops.flatMap localReadsOp
+
+partial def localReadsOp : SrcOp → Array Nat
+  | .letLocal i v => localReadsVal v |>.filter (· != i)
+  | .setLocal i v => localReadsVal v |>.filter (· != i)
+  | .checkedAddU64 l r => localReadsVal l ++ localReadsVal r
+  | .checkedSubU64 l r => localReadsVal l ++ localReadsVal r
+  | .checkedMulU64 l r => localReadsVal l ++ localReadsVal r
+  | .checkedDivU64 l r => localReadsVal l ++ localReadsVal r
+  | .checkedModU64 l r => localReadsVal l ++ localReadsVal r
+  | .ite _ l r thn els =>
+      localReadsVal l ++ localReadsVal r ++
+        (localReadsOps thn ++ localReadsOps els)
+  | .forAccum _ v _ => localReadsVal v
+  | .forBody _ body => localReadsOps body
+  | .indexSet _ i v _ _ => localReadsVal i ++ localReadsVal v
+  | .storeField _ v => localReadsVal v
+  | .okState v => localReadsVal v
+  | .returnU64 v => localReadsVal v
+  | .returnState v => localReadsVal v
+  | .externalCall _ args => args.flatMap localReadsVal
+  | .emitEvent _ v => localReadsVal v
+  | .indexSetLeaf _ i v _ _ => localReadsVal i ++ localReadsVal v
+  | _ => #[]
+
+partial def localReadsVal : SrcVal → Array Nat
+  | .local i => #[i]
+  | .field base _ => localReadsVal base
+  | .bitAnd l r | .bitOr l r | .bitXor l r | .shiftL l r | .shiftR l r
+  | .addU64 l r | .subU64 l r | .mulU64 l r | .divU64 l r | .modU64 l r =>
+      localReadsVal l ++ localReadsVal r
+  | .bitNot v => localReadsVal v
+  | .indexGet b _ i _ _ => localReadsVal b ++ localReadsVal i
+  | .select _ l r t e =>
+      localReadsVal l ++ localReadsVal r ++ localReadsVal t ++ localReadsVal e
+  | .ext _ operands => operands.flatMap localReadsVal
+  | _ => #[]
+
+end
+
+
+
 /-- Translate one op sequence (method body or one branch) to Plan statements.
     Returns the statements plus the post-sequence environment for branch merges. -/
 partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
@@ -420,22 +468,47 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
           { cur with pending := none, sawStore := false }
         -- φ-merge locals: a local whose value differs across arms becomes
         -- `select cond thn els`; the unchanged side falls back to the
-        -- pre-branch binding. Binding in exactly one arm with no pre-branch
-        -- binding fails closed (unsound otherwise).
-        let keys := ((thnSt.env.map (·.1)) ++ (elsSt.env.map (·.1))).toList.eraseDups
+        -- pre-branch binding. A local bound in exactly one arm and NOT read
+        -- after the branch is branch-private (its binding dies with the
+        -- arm); failing closed here would reject canonical
+        -- `if c then (let x := …; store x) else revert` guard shapes.
+        -- Branch-private bindings (a local bound in exactly one arm) are
+        -- admissible when the opposing arm is a lone trap: the trap path
+        -- never joins, so the binding dies with the arm (canonical
+        -- `if c then (let x := …; …) else revert` guard shape). Otherwise
+        -- require symmetric binding (unsound otherwise).
+        let opposingTrap := isLoneTrap thnStmts || isLoneTrap elsStmts
+        let keys :=
+          (((thnSt.env.map (·.1)) ++ (elsSt.env.map (·.1))).toList.eraseDups).filter
+            fun i =>
+              if opposingTrap then
+                -- a one-sided binding is fine; a two-sided one still merges
+                (thnSt.env.find? (·.1 == i)).isSome &&
+                  (elsSt.env.find? (·.1 == i)).isSome
+              else true
         let mut merged := cur.env
         for i in keys do
           let before? := (cur.env.find? (·.1 == i)).map (·.2)
           let te? := (thnSt.env.find? (·.1 == i)).map (·.2)
           let ee? := (elsSt.env.find? (·.1 == i)).map (·.2)
-          let te := te?.getD (←
-            match before? with
-            | some old => pure old
-            | none => lowerError s!"local {i} bound in the then branch only")
-          let ee := ee?.getD (←
-            match before? with
-            | some old => pure old
-            | none => lowerError s!"local {i} bound in the else branch only")
+          let te ←
+            match te? with
+            | some t => pure t
+            | none =>
+                match before? with
+                | some old => pure old
+                | none =>
+                    if opposingTrap then pure (ee?.getD (.literal 0))
+                    else lowerError s!"local {i} bound in the then branch only"
+          let ee ←
+            match ee? with
+            | some e => pure e
+            | none =>
+                match before? with
+                | some old => pure old
+                | none =>
+                    if opposingTrap then pure te
+                    else lowerError s!"local {i} bound in the else branch only"
           unless te == ee do
             merged := merged.filter (·.1 != i) |>.push (i, Expr.select condExpr te ee)
         cur := { cur with env := merged }
@@ -443,16 +516,17 @@ partial def opsToStmts (ctx : Ctx) (leafNames : Array String)
         unless thnStmts.isEmpty && elsStmts.isEmpty do
           out := out.push (.ifThenElse condExpr thnStmts elsStmts)
     | .forAccum n addend resultLocal => do
-        -- Sum `addend` over [0, n): acc := lit 0; acc := acc + addend × n,
-        -- with the loop variable substituted as literal k per step (checked
-        -- chain — every step traps on overflow, matching PSY-LOOP semantics).
+        -- Sum `addend` over [0, n): unroll n checked-add steps; the loop
+        -- variable inside the addend becomes the literal step index k
+        -- (PSY-LOOP semantics: bound assert at DPN lowering + per-step traps).
         unless n ≤ maxUnrollSteps do
           return ← lowerError s!"forAccum bound {n} exceeds the unroll limit {maxUnrollSteps}"
-        let addendE ← valToExpr ctx cur.env addend
-        let addendSub := substituteLoopIx addendE none  -- no loopIx in accumulator form
+        let mut acc : Expr := .literal 0
+        for k in [0:n] do
+          let addendK ← valToExpr ctx cur.env (substituteLoopIxVal addend k)
+          acc := .checkedAdd acc addendK
         cur := { cur with
-          env := cur.env.filter (·.1 != resultLocal)
-            |>.push (resultLocal, unrollAccum (Expr.literal 0) addendSub n) }
+          env := cur.env.filter (·.1 != resultLocal) |>.push (resultLocal, acc) }
     | .forBody n body => do
         -- State loop: unroll n guarded steps; loopIx inside the body becomes
         -- the literal step index. Body stores stay inside the step's branch
