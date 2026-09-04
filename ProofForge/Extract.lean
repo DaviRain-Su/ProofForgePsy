@@ -776,7 +776,10 @@ private def variantFragment (typeName name : String) (place : Core.Place)
 private def isCompilerKnownWrapper (env : Environment) (tyName : Name) : Bool :=
   tyName == ``ProofForge.Core.Value.BoundedVec ||
     tyName == ``ProofForge.Core.Value.BoundedBytes ||
-    tyName == ``ProofForge.Core.Value.BoundedString
+    tyName == ``ProofForge.Core.Value.BoundedString ||
+    tyName == ``ProofForge.Core.Value.UInt128 ||
+    tyName == ``ProofForge.Core.Value.UInt256 ||
+    tyName == ``ProofForge.Core.Value.FixedBytes
 
 private def leafSchema (env : Environment) (fuel : Nat) (name : String)
     (place : Core.Place) (ty : Expr) : Except String SchemaFragment :=
@@ -859,6 +862,20 @@ private def leafSchema (env : Environment) (fuel : Nat) (name : String)
           let fields := getStructureFields env tyName
           if fields.isEmpty then
             .error s!"extract/unsupported: field {name} record has no fields"
+          else if tyName == ``ProofForge.Core.Value.UInt128 ||
+              tyName == ``ProofForge.Core.Value.UInt256 ||
+              tyName == ``ProofForge.Core.Value.FixedBytes then
+            -- Fixed-limb boundary structs: each UInt64 field is one state
+            -- leaf, named `{field}_{limb}`.
+            Id.run do
+              let mut acc : SchemaFragment := {}
+              let fields := getStructureFields env tyName
+              for f in fields do
+                let leafPlace := place.push (.field tyName.toString 0 f.toString)
+                match leafSchema env fuel' s!"{name}_{f}" leafPlace (.const ``UInt64 []) with
+                | .error r => return .error r
+                | .ok item => acc := { acc with leaves := acc.leaves ++ item.leaves }
+              return .ok acc
           else if isCompilerKnownWrapper env tyName then
             -- Compiler-known fixed-frame wrappers: `length : UInt32` leaf +
             -- `values : Vector elemTy capacity` flattened with the use-site

@@ -493,6 +493,14 @@ private def uint256CtorFields (env : Environment) (e : Expr) : Option (Array Exp
       else none
     | _ => none
 
+private def uint128Leaves (env : Environment) (e : Expr) : Ops.Val × Ops.Val :=
+  let e := unfoldUserHelpers env 8 e
+  let w0 := (val env (mkApp (mkConst ``ProofForge.Core.Value.UInt128.w0) e))
+      |>.getD (flattenField (.arg 0) "w0")
+  let w1 := (val env (mkApp (mkConst ``ProofForge.Core.Value.UInt128.w1) e))
+      |>.getD (flattenField (.arg 0) "w1")
+  (w0, w1)
+
 private def uint256Leaves (env : Environment) (e : Expr) :
     Ops.Val × Ops.Val × Ops.Val × Ops.Val :=
   let e := unfoldUserHelpers env 8 e
@@ -1304,6 +1312,12 @@ private partial def flattenInitValue (env : Environment) (fuel : Nat) (ty e : Ex
           tyName? == some ``UInt16 || tyName? == some ``UInt8 then
         (val env e).map (#[·])
       else if isUInt256Type ty then
+        let (w0, w1, w2, w3) := uint256Leaves env e
+        some #[w0, w1, w2, w3]
+      else if tyName? == some ``ProofForge.Core.Value.UInt128 then
+        let (w0, w1) := uint128Leaves env e
+        some #[w0, w1]
+      else if tyName? == some ``ProofForge.Core.Value.FixedBytes then
         let (w0, w1, w2, w3) := uint256Leaves env e
         some #[w0, w1, w2, w3]
       else if tyName? == some ``Bool then
