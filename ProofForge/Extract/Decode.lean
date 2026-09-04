@@ -1496,12 +1496,23 @@ private partial def flattenLeaves (env : Environment) (base : String) (e : Expr)
               -- projection only inherits that field; reducing it through the constructor would
               -- replay a transition rather than describe an outer write.
               let fieldTy? := fieldTypeExpr env c.induct names[i]
+              let isUInt128Field :=
+                match fieldTy? with
+                | some ty => isUInt128Type ty
+                | none => false
               let isUInt256Field :=
                 match fieldTy? with
                 | some ty => isUInt256Type ty
                 | none => false
               if inheritedFromAppliedBase then
                 pure ()
+              else if isUInt128Field then
+                let (w0, w1) := uint128Leaves env nestedArg
+                let l0 := s!"{child}_w0"
+                let l1 := s!"{child}_w1"
+                unless looksUnchangedWideLeaf w0 l0 do acc := acc.push (l0, w0)
+                unless looksUnchangedWideLeaf w1 l1 do acc := acc.push (l1, w1)
+
               else if isUInt256Field then
                 let (w0, w1, w2, w3) := uint256Leaves env nestedArg
                 let l0 := s!"{child}_w0"
