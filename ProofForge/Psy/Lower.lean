@@ -38,6 +38,7 @@ namespace ProofForge.Psy.Lower
 
 open ProofForge.Psy.Plan
 
+
 private def lowerError (message : String) : Except String α :=
   .error s!"psy/lower: {message}"
 
@@ -158,6 +159,9 @@ private def envLookup (env : LocalEnv) (i : Nat) : Except String Expr :=
   | none => lowerError s!"unbound local {i}"
 
 /-- Translate one target-neutral scalar value into a Plan expression. -/
+
+private def mapFcMessage : String :=
+  "pf.map.* requires a Map state field (DPN-5 pilot deferred)"
 partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Expr
   | .lit n => pure (.literal n)
   | .arg i =>
@@ -223,7 +227,11 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         return ← lowerError s!"psy SDK leaf {repr kind} expects at most {Psy.Ops.ValKind.arity kind} operands, got {operands.size}"
       let oe ← operands.mapM (valToExpr ctx env)
       let atIdx (i : Nat) : Expr := oe.getD i (.literal 0)
-      pure (match kind with
+      match kind with
+      | .mapGet | .mapPut =>
+          return ← lowerError mapFcMessage
+      | kind' =>
+      pure (match kind' with
         | .ctxUserId => .ctxUserId
         | .ctxContractId => .ctxContractId
         | .ctxCheckpointId => .ctxCheckpointId
@@ -253,12 +261,8 @@ partial def valToExpr (ctx : Ctx) (env : LocalEnv) : SrcVal → Except String Ex
         | .imtGetExternal => .imtGetExternal (atIdx 0) (atIdx 1)
         | .imtGetOther => .imtGetOther (atIdx 0) (atIdx 1) (atIdx 2)
         | .imtContainsOther => .imtContainsOther (atIdx 0) (atIdx 1) (atIdx 2)
-        | .mapGet | .mapPut =>
-            -- Dense Map state requires a language-level Map surface (the
-            -- official custom DSL); plain-Lean sources express it via the
-            -- SDK once the state carries the 24 pilot leaves.
-            return ← lowerError "pf.map.* requires a Map state field; the \
-plain-Lean source surface does not yet declare one (DPN-5 pilot deferred)"
+        | .mapGet | .mapPut => .literal 0  -- unreachable: routed out above
+      )
 
 
 private def isErrorTerminal : SrcOp → Bool
@@ -387,6 +391,7 @@ private def balanceTrapArms (thn els : Array Statement) :
   | _, _ => (thn, els)
 
 mutual
+
 /-- Local ids read by an op sequence (env lookups in operands / terminal
     returns). Used to decide which branch-bound locals the continuation
     actually consumes. -/
